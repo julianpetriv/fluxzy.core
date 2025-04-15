@@ -52,8 +52,7 @@ namespace Fluxzy.Clients.Ssl.BouncyCastle
 
                 sorted.Add(type, extensionData);
             }
-            
-            return sorted;
+            return clientExtensionTypes.ToDictionary(t => t, t => sorted[t]);
         }
         
         internal byte[]? GetDefaultClientValueExtension(
