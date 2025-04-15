@@ -260,7 +260,7 @@ namespace Fluxzy.Core
                                 exchange.Context.GetSubstitutedRequestBody(exchange.Request.Body!,
                                     exchange).ConfigureAwait(false);
 
-                            exchange.Request.Header.ForceTransferChunked();
+                            //exchange.Request.Header.ForceTransferChunked();
                         }
 
                         if (exchange.Request.Body != null &&
