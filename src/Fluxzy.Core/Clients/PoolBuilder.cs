@@ -48,7 +48,7 @@ namespace Fluxzy.Clients
 
         private readonly ConcurrentDictionary<string, DefaultDnsResolver> _dnsSolversCache = new();
 
-        private Synchronizer<Authority> _synchronizer = new(true);
+        private readonly Synchronizer<Authority> _synchronizer = new(true);
 
         public PoolBuilder(
             RemoteConnectionBuilder remoteConnectionBuilder,
@@ -160,7 +160,7 @@ namespace Fluxzy.Clients
 
 
                 //  pool 
-                if (exchange.Context.BlindMode) {
+                if (exchange.Context.BlindMode && exchange.Authority.Secure) {
                     var tunneledConnectionPool = new TunnelOnlyConnectionPool(
                         exchange.Authority, _timingProvider,
                         _remoteConnectionBuilder, proxyRuntimeSetting, dnsResolutionResult);
