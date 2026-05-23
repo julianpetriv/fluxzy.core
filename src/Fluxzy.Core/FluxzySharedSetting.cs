@@ -22,6 +22,9 @@ namespace Fluxzy
             SkipCollectingEnvironmentInformation =
                 Environment.GetEnvironmentVariable("SkipCollectingEnvironmentInformation") == "1";
 
+            RedactSettingsInArchive =
+                Environment.GetEnvironmentVariable("FLUXZY_REDACT_SETTINGS_IN_ARCHIVE") == "1";
+
             if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("appdata"))) {
                 // for macOS and linux, this environment variable used in several temp file (certcache) is not 
                 // set leading unwanted folder creation
@@ -51,6 +54,14 @@ namespace Fluxzy
         ///     When set to true, the proxy will not collect environment information on the archive file
         /// </summary>
         public static bool SkipCollectingEnvironmentInformation { get; set; }
+
+        /// <summary>
+        ///     When set to true, the FluxzySetting snapshot embedded in archive meta information will
+        ///     omit alteration rules and the save filter (in addition to the always-on redaction of
+        ///     credentials and local file paths). Settable via the FLUXZY_REDACT_SETTINGS_IN_ARCHIVE
+        ///     environment variable.
+        /// </summary>
+        public static bool RedactSettingsInArchive { get; set; }
 
         /// <summary>
         /// </summary>
@@ -101,5 +112,19 @@ namespace Fluxzy
         /// </summary>
         public static int RawCaptureLingerDelayBeforeTearDownMillis { get; set; } =
             EnvironmentUtility.GetInt32("RAW_CAPTURE_LINGER_DELAY_BEFORE_TEARDOWN", 200);
+
+        /// <summary>
+        ///     The cache validity duration in seconds for process tracking information.
+        ///     Can be set by environment variable FLUXZY_PROCESS_TRACKER_CACHE_SECONDS.
+        /// </summary>
+        public static int ProcessTrackerCacheSeconds { get; set; } =
+            EnvironmentUtility.GetInt32("FLUXZY_PROCESS_TRACKER_CACHE_SECONDS", 30);
+
+        /// <summary>
+        ///     True when Fluxzy runs under Fluxzy Desktop (detected via the FluxzyDesktopVersion
+        ///     environment variable). Gates desktop-only hot-path checks like live-edit header scanning.
+        /// </summary>
+        public static bool LiveEditEnabled { get; } =
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("FluxzyDesktopVersion"));
     }
 }

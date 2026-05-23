@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -10,6 +11,7 @@ using Fluxzy.Clients;
 using Fluxzy.Clients.H11;
 using Fluxzy.Clients.H2.Encoder;
 using Fluxzy.Rules;
+using Fluxzy.Utils.ProcessTracking;
 
 namespace Fluxzy.Core
 {
@@ -78,9 +80,11 @@ namespace Fluxzy.Core
 
             Metrics.ReceivedFromProxy = receivedFromProxy;
 
-            RunInLiveEdit = requestHeader.HeaderFields
-                                         .Any(h => h.Name.Span.Equals("x-fluxzy-live-edit",
-                                             StringComparison.OrdinalIgnoreCase));
+            if (FluxzySharedSetting.LiveEditEnabled) {
+                RunInLiveEdit = requestHeader.HeaderFields
+                                             .Any(h => h.Name.Span.Equals("x-fluxzy-live-edit",
+                                                 StringComparison.OrdinalIgnoreCase));
+            }
         }
 
         /// <summary>
@@ -150,6 +154,8 @@ namespace Fluxzy.Core
         internal TaskCompletionSource<bool> ExchangeCompletionSource { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        internal Activity? LogActivity { get; set; }
+
         public ExchangeContext Context { get; }
 
         public bool RunInLiveEdit { get; set; }
@@ -182,6 +188,28 @@ namespace Fluxzy.Core
 
         public bool ReadUntilClose { get; set; }
 
+        /// <summary>
+        ///     True when this exchange is being processed on a connection that
+        ///     was reused from the pool (rather than freshly opened). The
+        ///     HTTP/1.1 pool sets this so the response-read failure path can
+        ///     tell "stale pooled connection died on us" (safe to relaunch on
+        ///     a fresh connection) apart from "fresh connection failed
+        ///     immediately" (genuine upstream error — must surface to caller,
+        ///     not retry).
+        /// </summary>
+        public bool RecycledConnection { get; set; }
+
+        public int StreamIdentifier { get; set; }
+
+        /// <summary>
+        ///     Bridges the upstream connection pool to the downstream pipe for interim
+        ///     (1xx) responses — specifically `100 Continue` when the client sent
+        ///     `Expect: 100-continue`. Set by <see cref="ProxyOrchestrator"/> once the
+        ///     exchange is bound to a downstream pipe. Null when unsupported (e.g. H2
+        ///     downstream, tunnel mode).
+        /// </summary>
+        internal Func<int, ReadOnlyMemory<char>, System.Threading.CancellationToken, ValueTask>? InterimResponseWriter { get; set; }
+
         public IEnumerable<HeaderFieldInfo> GetRequestHeaders()
         {
             return Request.Header.Headers.Select(t => (HeaderFieldInfo) t);
@@ -192,7 +220,23 @@ namespace Fluxzy.Core
             return Response.Header?.Headers.Select(t => (HeaderFieldInfo) t);
         }
 
+        public IEnumerable<HeaderFieldInfo>? GetRequestTrailers()
+        {
+            return Request.Trailers?.Select(t => (HeaderFieldInfo) t);
+        }
+
+        public IEnumerable<HeaderFieldInfo>? GetResponseTrailers()
+        {
+            return Response.Trailers?.Select(t => (HeaderFieldInfo) t);
+        }
+
         public Agent? Agent { get; set; }
+
+        /// <summary>
+        ///     Information about the local process that initiated this exchange.
+        ///     Null if process tracking is disabled or the connection is not from localhost.
+        /// </summary>
+        public ProcessInfo? ProcessInfo { get; set; }
 
         public List<ClientError> ClientErrors { get; } = new();
 
@@ -283,6 +327,11 @@ namespace Fluxzy.Core
 
         public Stream? Body { get; set; }
 
+        /// <summary>
+        ///     HTTP trailer fields received after the request body.
+        /// </summary>
+        public List<HeaderField>? Trailers { get; set; }
+
         public override string ToString()
         {
             return Header.ToString();
@@ -294,6 +343,11 @@ namespace Fluxzy.Core
         public ResponseHeader? Header { get; set; }
 
         public Stream? Body { get; set; }
+
+        /// <summary>
+        ///     HTTP trailer fields received after the response body.
+        /// </summary>
+        public List<HeaderField>? Trailers { get; set; }
 
         public override string ToString()
         {

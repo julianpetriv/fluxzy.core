@@ -33,6 +33,7 @@ ignore:
   - "src/Fluxzy.Core.Pcap.Cli/**"
   - "src/Fluxzy.Extensions/**"
   - "src/Fluxzy.Tools.DocGen/**"
+  - "src/Fluxzy/Commands/PrettyOutput/**"
 
 # Ignore debugging code 
   - "src/Fluxzy.Core/Clients/H2Logger.cs"
@@ -40,3 +41,6 @@ ignore:
   - "src/Fluxzy.Core/Misc/Streams/DebugFileStream.cs"
   - "src/Fluxzy/ArgsHelper.cs"
   - "src/Fluxzy.Core/Misc/Traces/**"
+  - "src/Fluxzy.Core/Utils/ProcessTracking/LinuxProcessHelper.cs"
+  - "src/Fluxzy.Core/Utils/ProcessTracking/MacOsProcessHelper.cs"
+  - "src/Fluxzy.Core/Utils/ProcessTracking/MacOsNativeMethods.cs"

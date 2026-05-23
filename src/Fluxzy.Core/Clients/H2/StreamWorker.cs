@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Fluxzy.Clients.H2.Encoder;
 using Fluxzy.Clients.H2.Frames;
 using Fluxzy.Core;
+using Fluxzy.Logging;
 using Fluxzy.Misc.ResizableBuffers;
 
 namespace Fluxzy.Clients.H2
@@ -17,18 +18,21 @@ namespace Fluxzy.Clients.H2
         private readonly Exchange _exchange;
 
         private readonly SemaphoreSlim _headerReceivedSemaphore = new(0, 1);
-
-        private readonly H2Logger _logger;
-
+        
         private readonly Pipe _pipeResponseBody;
         private readonly CancellationTokenSource _resetTokenSource;
 
         private bool _disposed;
         private bool _firstBodyFragment = true;
 
-        private Memory<byte> _headerBuffer;
+        private byte[]? _headerBuffer;
 
+        private bool _headerEndedStream;
         private bool _noBodyStream;
+        private bool _responseHeadersComplete;
+
+        private volatile bool _abandonedByGoAway;
+        private Exception? _abandonInnerCause;
 
         private int _totalBodyReceived;
 
@@ -46,13 +50,18 @@ namespace Fluxzy.Clients.H2
             _exchange = exchange;
             _resetTokenSource = resetTokenSource;
 
-            RemoteWindowSize = new WindowSizeHolder(parent.Context.Logger,
-                parent.Context.Setting.OverallWindowSize,
+            RemoteWindowSize = new WindowSizeHolder(parent.Context.Setting.Remote.WindowSize,
                 streamIdentifier);
-
-            _logger = parent.Context.Logger;
-
-            _pipeResponseBody = new Pipe(new PipeOptions(MemoryPool<byte>.Shared));
+            
+            _pipeResponseBody = new Pipe(new PipeOptions(
+                pool: MemoryPool<byte>.Shared,
+                readerScheduler: PipeScheduler.ThreadPool,
+                writerScheduler: PipeScheduler.Inline,
+                pauseWriterThreshold: 0,
+                resumeWriterThreshold: 0,
+                minimumSegmentSize: 16384,
+                useSynchronizationContext: false
+            ));
         }
 
         public int StreamIdentifier { get; }
@@ -70,10 +79,13 @@ namespace Fluxzy.Clients.H2
         public void Dispose()
         {
             _disposed = true;
-
-            _logger.Trace(StreamIdentifier, ".... disposing");
-
+            
             RemoteWindowSize?.Dispose();
+
+            if (_headerBuffer != null) {
+                ArrayPool<byte>.Shared.Return(_headerBuffer);
+                _headerBuffer = null;
+            }
 
             try {
                 _headerReceivedSemaphore.Release();
@@ -82,8 +94,6 @@ namespace Fluxzy.Clients.H2
             catch (SemaphoreFullException) {
                 // We do nothing here
             }
-
-            _logger.Trace(StreamIdentifier, ".... disposed");
         }
 
         private async ValueTask<int> BookWindowSize(int requestedBodyLength, CancellationToken cancellationToken)
@@ -102,12 +112,54 @@ namespace Fluxzy.Clients.H2
                                             .BookWindowSize(streamWindow, cancellationToken)
                                             .ConfigureAwait(false);
 
+            // Refund the stream window for any bytes the overall window couldn't grant,
+            // otherwise they are permanently lost and the stream window gradually drains to zero.
+            if (overallWindow < streamWindow)
+                RemoteWindowSize.UpdateWindowSize(streamWindow - overallWindow);
+
             return overallWindow;
         }
 
         public void NotifyStreamWindowUpdate(int windowSizeUpdateValue)
         {
             RemoteWindowSize.UpdateWindowSize(windowSizeUpdateValue);
+        }
+
+        /// <summary>
+        ///     True once <see cref="AbandonAsRetryable"/> has been called — the server's
+        ///     GOAWAY indicated this stream was not processed.
+        /// </summary>
+        internal bool AbandonedByGoAway => _abandonedByGoAway;
+
+        internal Exception? AbandonInnerCause => _abandonInnerCause;
+
+        /// <summary>
+        ///     Proactively fail this stream as retryable because the remote sent GOAWAY
+        ///     with a <c>LastStreamId</c> below this stream's id. RFC 9113 §6.8 guarantees
+        ///     the server did not process it, so the orchestrator may safely reissue the
+        ///     exchange on a new connection.
+        ///     <para>
+        ///         Sets the abandon marker and cancels the stream's CTS so any in-flight
+        ///         awaits (header-received semaphore, window booking, body read) unblock
+        ///         with <see cref="OperationCanceledException"/>. The OCE catch paths
+        ///         upstream check <see cref="AbandonedByGoAway"/> and rewrap as
+        ///         <see cref="ConnectionCloseException"/> before returning to
+        ///         <see cref="H2ConnectionPool.Send"/>.
+        ///     </para>
+        /// </summary>
+        internal void AbandonAsRetryable(Exception? goAwayCause)
+        {
+            _abandonInnerCause = goAwayCause;
+            _abandonedByGoAway = true;
+
+            if (!_resetTokenSource.IsCancellationRequested) {
+                try {
+                    _resetTokenSource.Cancel();
+                }
+                catch (ObjectDisposedException) {
+                    // CTS already disposed — stream is tearing down on another path.
+                }
+            }
         }
 
         public void ResetByCaller(H2ErrorCode reason = H2ErrorCode.StreamClosed)
@@ -140,8 +192,6 @@ namespace Fluxzy.Clients.H2
 
                 if (_exchange.Response.Header != null)
                     value += _exchange.Response.Header.GetHttp11Header().ToString();
-
-                _logger.Trace(StreamIdentifier, $"Receive RST : {errorCode} from server.\r\n{value}");
             }
 
             _exchange.ExchangeCompletionSource
@@ -163,11 +213,16 @@ namespace Fluxzy.Clients.H2
                             exchange.Request.Body == null ||
                             (exchange.Request.Body.CanSeek && exchange.Request.Body.Length == 0);
 
+            _headerEndedStream = endStream;
+
             var readyToBeSent = Parent.Context.HeaderEncoder.Encode(
                 new HeaderEncodingJob(exchange.Request.Header.GetHttp11Header(), StreamIdentifier, StreamDependency),
                 buffer, endStream);
 
             exchange.Metrics.RequestHeaderSending = ITimingProvider.Default.Instant();
+            exchange.Metrics.RequestHeaderLength = readyToBeSent.Length;
+
+            FluxzyLogEvents.LogRequestSending(Parent.Context.Logger, exchange);
 
             var writeHeaderTask = new WriteTask(H2FrameType.Headers, StreamIdentifier, StreamPriority,
                 StreamDependency, readyToBeSent);
@@ -176,14 +231,24 @@ namespace Fluxzy.Clients.H2
 
             return writeHeaderTask.DoneTask
                                   .ContinueWith(t => {
-                                      exchange.Metrics.RequestHeaderLength = readyToBeSent.Length;
-
                                       return _exchange.Metrics.TotalSent += readyToBeSent.Length;
                                   }, token);
         }
 
         public async ValueTask ProcessRequestBody(Exchange exchange, RsBuffer buffer, CancellationToken token)
         {
+            // HEADERS already carried END_STREAM (e.g. Content-Length: 0). The stream is
+            // half-closed (local) — sending any DATA frame now would be a PROTOCOL_ERROR
+            // on a closed stream, so we must not enter the body loop. This matters for
+            // clients like Firefox that send HEADERS + DATA[END_STREAM, 0] for zero-length
+            // POSTs: Fluxzy exposes the empty request body as a non-seekable pipe stream,
+            // which would otherwise trip the loop's "!CanSeek" entry condition.
+            if (_headerEndedStream) {
+                exchange.Metrics.RequestBodySent = ITimingProvider.Default.Instant();
+                FluxzyLogEvents.LogRequestSent(Parent.Context.Logger, exchange, earlyResponse: false);
+                return;
+            }
+
             var totalSent = 0;
             var requestBodyStream = exchange.Request.Body;
             var bodyLength = exchange.Request.Header.ContentLength;
@@ -235,19 +300,60 @@ namespace Fluxzy.Clients.H2
 
                     _exchange.Metrics.TotalSent += dataFramePayloadLength;
 
-                    if (dataFramePayloadLength == 0 || endStream)
+                    if (dataFramePayloadLength == 0 || endStream) {
+                        exchange.Metrics.RequestBodySent = ITimingProvider.Default.Instant();
+                        FluxzyLogEvents.LogRequestSent(Parent.Context.Logger, exchange, earlyResponse: false);
                         return;
+                    }
 
-                    // This is for back pressure 
+                    // This is for back pressure
                     await writeTaskBody.DoneTask.ConfigureAwait(false);
                 }
             }
+        }
+
+        /// <summary>
+        ///     Ensure <see cref="_headerBuffer"/> is rented from <see cref="ArrayPool{T}.Shared"/>
+        ///     and has at least <paramref name="requiredLength"/> capacity. Shared between the
+        ///     response-header and trailer accumulation paths. Grows by renting a new array,
+        ///     copying the existing prefix, and returning the old one.
+        /// </summary>
+        private void EnsureHeaderBuffer(int requiredLength)
+        {
+            if (_headerBuffer == null) {
+                var initial = Math.Max(requiredLength, Parent.Context.Setting.MaxHeaderSize);
+                _headerBuffer = ArrayPool<byte>.Shared.Rent(initial);
+                return;
+            }
+
+            if (requiredLength <= _headerBuffer.Length)
+                return;
+
+            // Grow up to the negotiated MaxHeaderListSize
+            var maxAllowed = Parent.Context.Setting.Local.MaxHeaderListSize;
+
+            if (requiredLength > maxAllowed)
+                throw new H2Exception(
+                    $"Response header size ({requiredLength}) exceeds negotiated maximum ({maxAllowed})",
+                    H2ErrorCode.FrameSizeError);
+
+            var newSize = Math.Min(Math.Max(requiredLength, _headerBuffer.Length * 2), maxAllowed);
+            var newBuffer = ArrayPool<byte>.Shared.Rent(newSize);
+            _headerBuffer.AsSpan(0, _totalHeaderReceived).CopyTo(newBuffer);
+            ArrayPool<byte>.Shared.Return(_headerBuffer);
+            _headerBuffer = newBuffer;
         }
 
         internal void ReceiveHeaderFragmentFromConnection(ref HeadersFrame headerFrame)
         {
             _exchange.Metrics.TotalReceived += headerFrame.BodyLength;
             _exchange.Metrics.ResponseHeaderLength += headerFrame.BodyLength;
+
+            if (_responseHeadersComplete) {
+                // This is a trailing HEADERS frame (after body data)
+                ReceiveTrailerFragmentFromConnection(headerFrame.Data, headerFrame.EndHeaders);
+                return;
+            }
 
             if (_exchange.Metrics.ResponseHeaderStart == default)
                 _exchange.Metrics.ResponseHeaderStart = ITimingProvider.Default.Instant();
@@ -262,6 +368,12 @@ namespace Fluxzy.Clients.H2
         {
             _exchange.Metrics.TotalReceived += continuationFrame.BodyLength;
             _exchange.Metrics.ResponseHeaderLength += continuationFrame.BodyLength;
+
+            if (_responseHeadersComplete) {
+                ReceiveTrailerFragmentFromConnection(continuationFrame.Data, continuationFrame.EndHeaders);
+                return;
+            }
+
             ReceiveHeaderFragmentFromConnection(continuationFrame.Data, continuationFrame.EndHeaders);
         }
 
@@ -269,16 +381,15 @@ namespace Fluxzy.Clients.H2
             ReadOnlyMemory<byte> buffer,
             bool lastHeaderFragment)
         {
-            if (_headerBuffer.IsEmpty)
-                _headerBuffer = new byte[Parent.Context.Setting.MaxHeaderSize];
+            EnsureHeaderBuffer(_totalHeaderReceived + buffer.Length);
 
-            buffer.CopyTo(_headerBuffer.Slice(_totalHeaderReceived));
+            buffer.Span.CopyTo(_headerBuffer.AsSpan(_totalHeaderReceived));
             _totalHeaderReceived += buffer.Length;
 
             if (lastHeaderFragment) {
                 _exchange.Metrics.ResponseHeaderEnd = ITimingProvider.Default.Instant();
 
-                var charHeader = DecodeAndAllocate(_headerBuffer.Slice(0, _totalHeaderReceived).Span);
+                var charHeader = H2Helper.DecodeAndAllocate(Parent.Context.HeaderEncoder, _headerBuffer.AsSpan(0, _totalHeaderReceived));
 
                 _exchange.Response.Header = new ResponseHeader(charHeader, true, false);
 
@@ -288,7 +399,7 @@ namespace Fluxzy.Clients.H2
                     return; // We wait for more header and ignore 103
                 }
 
-                _logger.TraceResponse(this, _exchange);
+                FluxzyLogEvents.LogResponseHeaderReceived(Parent.Context.Logger, _exchange);
 
                 if (DebugContext.InsertFluxzyMetricsOnResponseHeader) {
                     var headerName = "fluxzy-h2-debug";
@@ -300,49 +411,62 @@ namespace Fluxzy.Clients.H2
                         new HeaderField(headerName, headerValue));
                 }
 
-                _logger.Trace(StreamIdentifier, "Releasing semaphore");
-
+                _responseHeadersComplete = true;
+                _totalHeaderReceived = 0; // Reset for possible trailer accumulation
+                
                 _headerReceivedSemaphore.Release();
             }
         }
 
-        private Memory<char> DecodeAndAllocate(ReadOnlySpan<byte> onWire)
+        private void ReceiveTrailerFragmentFromConnection(
+            ReadOnlyMemory<byte> buffer,
+            bool lastHeaderFragment)
         {
-            var byteArray = ArrayPool<char>.Shared.Rent(1024 * 64);
+            EnsureHeaderBuffer(_totalHeaderReceived + buffer.Length);
 
-            try {
-                Span<char> tempBuffer = byteArray;
+            buffer.Span.CopyTo(_headerBuffer.AsSpan(_totalHeaderReceived));
+            _totalHeaderReceived += buffer.Length;
 
-                var decoded = Parent.Context.HeaderEncoder.Decoder.Decode(onWire, tempBuffer);
-                Memory<char> charBuffer = new char[decoded.Length + 256];
+            if (lastHeaderFragment) {
+                // Decode trailer fields directly (no HTTP/1.1 status line)
+                var trailerFields = Parent.Context.HeaderEncoder.Decoder.DecodeTrailerFields(
+                    _headerBuffer.AsSpan(0, _totalHeaderReceived));
 
-                decoded.CopyTo(charBuffer.Span);
-                var length = decoded.Length;
+                _exchange.Response.Trailers = trailerFields;
+                
+                // Trailers always signal end of stream — complete the body pipe and exchange
+                if (_exchange.Metrics.ResponseBodyEnd == default)
+                    _exchange.Metrics.ResponseBodyEnd = ITimingProvider.Default.Instant();
 
-                return charBuffer.Slice(0, length);
-            }
-            finally {
-                ArrayPool<char>.Shared.Return(byteArray);
+                try {
+                    _pipeResponseBody.Writer.Complete();
+                }
+                catch {
+                    // Pipe may already be completed
+                }
+
+                _exchange.ExchangeCompletionSource.TrySetResult(false);
+                Parent.NotifyDispose(this);
             }
         }
-
+        
         public async ValueTask ProcessResponse(CancellationToken cancellationToken, H2ConnectionPool cp)
         {
-            SendWindowUpdate(Parent.Context.Setting.Local.WindowSize, StreamIdentifier);
-
             try {
-                _logger.Trace(StreamIdentifier, "Before semaphore ");
-
                 if (!cancellationToken.IsCancellationRequested)
                     await _headerReceivedSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-                _logger.Trace(StreamIdentifier, "Acquire semaphore ");
             }
             catch (OperationCanceledException) {
-                _logger.Trace(StreamIdentifier, $"Received no header, cancelled by caller {StreamIdentifier}");
+                if (_abandonedByGoAway) {
+                    Parent.NotifyDispose(this);
+                    throw new ConnectionCloseException(
+                        "Stream abandoned after remote GOAWAY; request was not processed",
+                        _abandonInnerCause);
+                }
 
                 throw new ClientErrorException(1,
-                    "The connection was interrupted before receiving response header");
+                    "The connection was interrupted before receiving response header",
+                    networkErrorCode: NetworkErrorCodes.ProtocolError);
             }
             catch (Exception) {
                 Parent.NotifyDispose(this);
@@ -357,7 +481,6 @@ namespace Fluxzy.Clients.H2
                 await _pipeResponseBody.Writer.CompleteAsync().ConfigureAwait(false);
 
                 _exchange.ExchangeCompletionSource.TrySetResult(false);
-
                 Parent.NotifyDispose(this);
             }
         }
@@ -370,66 +493,44 @@ namespace Fluxzy.Clients.H2
             }
 
             _totalBodyReceived += buffer.Length;
-
-            _logger.TraceDeep(StreamIdentifier, () => "a - 1");
-
+            
             if (_firstBodyFragment) {
                 _exchange.Metrics.ResponseBodyStart = ITimingProvider.Default.Instant();
                 _firstBodyFragment = false;
-
-                _logger.Trace(_exchange, StreamIdentifier,
-                    () => "First body block received");
             }
 
-            _logger.TraceDeep(StreamIdentifier, () => "a - 2");
             OnDataConsumedByCaller(buffer.Length);
 
             if (endStream) {
-                _logger.Trace(_exchange, StreamIdentifier,
-                    () => "Total body received : " + _totalBodyReceived);
-
                 _exchange.Metrics.ResponseBodyEnd = ITimingProvider.Default.Instant();
             }
 
             _exchange.Metrics.TotalReceived += buffer.Length;
 
-            _logger.TraceDeep(StreamIdentifier, () => "a - 3");
-
             var cancelled = false;
 
             try {
                 _pipeResponseBody.Writer.Write(buffer.Span);
+                _pipeResponseBody.Writer.FlushAsync().GetAwaiter().GetResult();
             }
             catch {
                 cancelled = true;
             }
-
-            // var flushResult = await _pipeResponseBody.Writer.WriteAsync(buffer, token);
-
-            _logger.TraceDeep(StreamIdentifier, () => "a - 4");
-
+            
             var shouldEnd = endStream || cancelled;
 
             if (shouldEnd) {
                 if (_exchange.Metrics.ResponseBodyEnd == default)
                     _exchange.Metrics.ResponseBodyEnd = ITimingProvider.Default.Instant();
 
-                _logger.Trace(_exchange, StreamIdentifier,
-                    () => "End");
-
                 if (!cancelled)
                     _pipeResponseBody.Writer.Complete();
-
-                _logger.TraceDeep(StreamIdentifier, () => "a - 5");
-
+                
                 _exchange.ExchangeCompletionSource.TrySetResult(false);
 
                 // Give a chance for semaphores to released before disposed
 
                 // await Task.Yield();
-
-                _logger.TraceDeep(StreamIdentifier, () => "a - 6");
-
                 Parent.NotifyDispose(this);
             }
         }

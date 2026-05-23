@@ -1,6 +1,7 @@
 // Copyright 2021 - Haga Rakotoharivelo - https://github.com/haga-rak
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -9,18 +10,29 @@ using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using Fluxzy.Logging;
 using Fluxzy.Misc.Streams;
-using Fluxzy.Misc.Traces;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Fluxzy.Core
 {
     internal class SecureConnectionUpdater
     {
-        private readonly ICertificateProvider _certificateProvider;
+        private static readonly List<SslApplicationProtocol> H11Protocols = new List<SslApplicationProtocol> { SslApplicationProtocol.Http11 };
+        private static readonly List<SslApplicationProtocol> H11AndH2Protocols = new List<SslApplicationProtocol> { SslApplicationProtocol.Http2, SslApplicationProtocol.Http11 };
+        
 
-        public SecureConnectionUpdater(ICertificateProvider certificateProvider)
+        private readonly ICertificateProvider _certificateProvider;
+        private readonly bool _serveH2;
+        private readonly ILogger _logger;
+
+        public SecureConnectionUpdater(
+            ICertificateProvider certificateProvider, bool serveH2, ILogger? logger = null)
         {
             _certificateProvider = certificateProvider;
+            _serveH2 = serveH2;
+            _logger = logger ?? NullLogger.Instance;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -57,27 +69,38 @@ namespace Fluxzy.Core
                 certificate = context.ServerCertificate ?? _certificateProvider.GetCertificate(host);
             }
             catch (Exception e) {
-                if (D.EnableTracing) {
-                    D.TraceException(e, "An error occured while getting certificate");
-                }
-                
+                FluxzyLogEvents.CertificateResolutionFailed(_logger, e, host);
                 throw;
             }
 
             try {
+
+                var effectiveServeH2 = _serveH2 && !context.ForceServeHttp11;
+
+                var sslProtocols = SslProtocols.None;
+
+                if (effectiveServeH2) {
+                    sslProtocols = SslProtocols.Tls12;
+
+#if NET8_0_OR_GREATER
+                    sslProtocols |= SslProtocols.Tls13;
+#endif
+                }
+
                 var sslServerAuthenticationOptions = new SslServerAuthenticationOptions
                 {
-                    ApplicationProtocols = new() { SslApplicationProtocol.Http11 },
+                    ApplicationProtocols = effectiveServeH2 ? H11AndH2Protocols : H11Protocols,
+                    EnabledSslProtocols = sslProtocols,
                     ClientCertificateRequired = false,
                     CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
                     EncryptionPolicy = EncryptionPolicy.RequireEncryption,
-                    EnabledSslProtocols = SslProtocols.None,
                     ServerCertificateSelectionCallback = (sender, name) => certificate
                 };
 
                 await secureStream
                     .AuthenticateAsServerAsync(sslServerAuthenticationOptions, token)
                     .ConfigureAwait(false);
+                
             }
             catch (Exception ex) {
                 throw new FluxzyException(
@@ -87,16 +110,20 @@ namespace Fluxzy.Core
                     };
             }
 
-            return new SecureConnectionUpdateResult(true, secureStream, secureStream);
+            return new SecureConnectionUpdateResult(true, secureStream, secureStream, secureStream.NegotiatedApplicationProtocol);
         }
     }
 
-    internal record SecureConnectionUpdateResult(bool IsSsl, Stream InStream, Stream OutStream)
+    internal record SecureConnectionUpdateResult(
+        bool IsSsl, Stream InStream, Stream OutStream,
+        SslApplicationProtocol NegotiatedApplicationProtocol = default)
     {
         public bool IsSsl { get; } = IsSsl;
-        
+
         public Stream InStream { get; } = InStream;
 
         public Stream OutStream { get; } = OutStream;
+
+        public SslApplicationProtocol NegotiatedApplicationProtocol { get; } = NegotiatedApplicationProtocol;
     }
 }

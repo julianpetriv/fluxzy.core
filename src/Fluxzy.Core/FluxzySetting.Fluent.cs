@@ -228,6 +228,19 @@ namespace Fluxzy
         }
 
         /// <summary>
+        ///     Configure how long the proxy waits for an upstream `100 Continue`
+        ///     before forwarding the request body anyway when the client used
+        ///     `Expect: 100-continue`. A value of <see cref="TimeSpan.Zero"/> or
+        ///     negative disables the interim-relay wait and makes the proxy send
+        ///     the body immediately after the request headers.
+        /// </summary>
+        public FluxzySetting SetExpectContinueTimeout(TimeSpan timeout)
+        {
+            ExpectContinueTimeout = timeout;
+            return this;
+        }
+
+        /// <summary>
         ///     Set the default protocols used by fluxzy
         /// </summary>
         /// <param name="protocols"></param>
@@ -273,6 +286,19 @@ namespace Fluxzy
         public FluxzySetting SetSkipGlobalSslDecryption(bool value)
         {
             GlobalSkipSslDecryption = value;
+
+            return this;
+        }
+
+        /// <summary>
+        ///     If true, Fluxzy will not register its built-in rules
+        ///     (welcome page on self-requests, CA download endpoint at /ca).
+        /// </summary>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public FluxzySetting SetSkipInternalRules(bool value)
+        {
+            SkipInternalRules = value;
 
             return this;
         }
@@ -490,6 +516,80 @@ namespace Fluxzy
         {
             UserAgentActionConfigurationFile = configurationFile;
 
+            return this;
+        }
+
+        /// <summary>
+        ///    Set whether to serve H2 to clients
+        /// </summary>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public FluxzySetting SetServeH2(bool value)
+        {
+            ServeH2 = value;
+            return this;
+        }
+
+        /// <summary>
+        ///     When set to true, the server certificate will be exported as PEM in the SSL connection information.
+        ///     This is useful for diagnostics or auditing purposes.
+        /// </summary>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public FluxzySetting SetExportCertificateInSslInfo(bool value)
+        {
+            ExportCertificateInSslInfo = value;
+            return this;
+        }
+
+        /// <summary>
+        ///     Enable or disable process tracking for localhost connections.
+        ///     When enabled, Fluxzy will attempt to identify the local process
+        ///     that initiated each connection using the source port.
+        /// </summary>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public FluxzySetting SetEnableProcessTracking(bool value)
+        {
+            EnableProcessTracking = value;
+            return this;
+        }
+
+        /// <summary>
+        ///     Enable or disable inclusion of Android emulator host (10.0.2.2) in IsSelfFilter.
+        ///     When enabled, the IsSelfFilter will also consider 10.0.2.2 as a local address.
+        ///     This is useful when Fluxzy is used with Android emulators where 10.0.2.2
+        ///     represents the host machine from within the emulator. Default is true.
+        /// </summary>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public FluxzySetting SetIncludeAndroidEmulatorHost(bool value)
+        {
+            IncludeAndroidEmulatorHost = value;
+            return this;
+        }
+
+        /// <summary>
+        ///     Add a directory containing .proto files for gRPC/protobuf decoding.
+        /// </summary>
+        /// <param name="directory"></param>
+        /// <returns></returns>
+        public FluxzySetting AddProtoDirectory(string directory)
+        {
+            ProtoDirectories.Add(directory);
+            return this;
+        }
+
+        /// <summary>
+        ///     Enable or disable the mDNS discovery service.
+        ///     When enabled, Fluxzy will announce its presence on the local network,
+        ///     allowing clients to discover the proxy automatically.
+        /// </summary>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public FluxzySetting SetEnableDiscoveryService(bool value)
+        {
+            EnableDiscoveryService = value;
             return this;
         }
     }

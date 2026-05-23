@@ -73,6 +73,28 @@ namespace Fluxzy.Clients.H2.Encoder.Utils
             StatusLineMappingStr.ToDictionary(t => t.Key.AsMemory(), t => t.Value.AsMemory(),
                 new SpanCharactersIgnoreCaseComparer());
 
+        private static readonly byte[]?[] StatusLineBytesByCode = BuildStatusLineBytesArray();
+
+        private static readonly byte[] UnknownStatusBytes = "Unknown status"u8.ToArray();
+
+        private static byte[]?[] BuildStatusLineBytesArray()
+        {
+            var max = 0;
+
+            foreach (var key in StatusLineMappingStr.Keys) {
+                var code = int.Parse(key);
+                if (code > max) max = code;
+            }
+
+            var arr = new byte[]?[max + 1];
+
+            foreach (var kv in StatusLineMappingStr) {
+                arr[int.Parse(kv.Key)] = System.Text.Encoding.ASCII.GetBytes(kv.Value);
+            }
+
+            return arr;
+        }
+
         public static readonly byte [] DoubleCrLf = new byte[] {13, 10, 13, 10};
 
 
@@ -126,12 +148,37 @@ namespace Fluxzy.Clients.H2.Encoder.Utils
                 ConnectionVerb, KeepAliveVerb, ProxyAuthenticate, Trailer, Upgrade, AltSvc, Expect, FluxzyLiveEdit
             }, new SpanCharactersIgnoreCaseComparer());
 
+        // RFC 9110 §7.6.1 hop-by-hop headers plus fluxzy-internal markers.
+        // Deliberately excludes Expect: the proxy must forward Expect: 100-continue
+        // to an HTTP/1.1 upstream so the origin keeps authority over whether to
+        // accept the body (issue #624). Expect is still stripped on H2 upstreams
+        // via NonH2Header, because HPACK forbids it.
+        public static readonly HashSet<ReadOnlyMemory<char>> H1HopByHopHeader =
+            new(new[] {
+                ConnectionVerb, KeepAliveVerb, ProxyAuthenticate, Trailer, Upgrade, AltSvc, FluxzyLiveEdit
+            }, new SpanCharactersIgnoreCaseComparer());
+
         public static ReadOnlyMemory<char> GetStatusLine(ReadOnlyMemory<char> statusCode)
         {
             if (StatusLineMapping.TryGetValue(statusCode, out var res))
                 return res;
 
             return "Unknown status".AsMemory();
+        }
+
+        public static ReadOnlySpan<byte> GetStatusLineBytes(int statusCode)
+        {
+            var arr = StatusLineBytesByCode;
+
+            if ((uint) statusCode < (uint) arr.Length) {
+                var val = arr[statusCode];
+
+                if (val != null) {
+                    return val;
+                }
+            }
+
+            return UnknownStatusBytes;
         }
 
         public static bool IsNonForwardableHeader(ReadOnlyMemory<char> headerName)
@@ -142,6 +189,11 @@ namespace Fluxzy.Clients.H2.Encoder.Utils
         public static bool IsNonForwardableHeader(string headerName)
         {
             return NonH2Header.Contains(headerName.AsMemory());
+        }
+
+        public static bool IsH1HopByHopHeader(ReadOnlyMemory<char> headerName)
+        {
+            return H1HopByHopHeader.Contains(headerName);
         }
     }
 }

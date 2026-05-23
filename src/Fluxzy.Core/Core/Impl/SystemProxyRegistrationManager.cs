@@ -47,7 +47,7 @@ namespace Fluxzy.Core
         {
             var existingSetting = await GetSystemProxySetting().ConfigureAwait(false);
 
-            if (_oldSetting != null && !existingSetting.Equals(_oldSetting))
+            if (_oldSetting == null)
                 _oldSetting = existingSetting;
 
             if (!_registerDone) {
@@ -79,7 +79,31 @@ namespace Fluxzy.Core
         }
 
         /// <summary>
-        /// Unregister any previous setting 
+        /// Returns true only if the OS proxy is currently enabled AND bound to the given endpoint.
+        /// Unlike <see cref="GetSystemProxySetting"/>, this filters out unrelated proxies
+        /// (corporate, Fiddler, another Fluxzy instance on a different port, ...).
+        /// </summary>
+        public async Task<bool> IsRegisteredOn(IPEndPoint endPoint)
+        {
+            var setting = await GetSystemProxySetting().ConfigureAwait(false);
+            var host = GetConnectableIpAddr(endPoint.Address);
+
+            return setting.MatchesEndPoint(new IPEndPoint(host, endPoint.Port));
+        }
+
+        /// <summary>
+        /// Overload mirroring the selection logic of <c>Register(IEnumerable&lt;IPEndPoint&gt;, ...)</c>:
+        /// prefers the loopback endpoint when multiple are provided.
+        /// </summary>
+        public Task<bool> IsRegisteredOn(IEnumerable<IPEndPoint> endPoints)
+        {
+            return IsRegisteredOn(endPoints.OrderByDescending(t => Equals(t.Address, IPAddress.Loopback)
+                                                                   || t.Address.Equals(IPAddress.IPv6Loopback))
+                                           .First());
+        }
+
+        /// <summary>
+        /// Unregister any previous setting
         /// </summary>
         /// <returns></returns>
         public async Task UnRegister()
@@ -87,6 +111,7 @@ namespace Fluxzy.Core
             if (_oldSetting != null) {
                 await _systemProxySetter.ApplySetting(_oldSetting).ConfigureAwait(false);
                 _oldSetting = null;
+                _currentSetting = null;
 
                 return;
             }
@@ -99,12 +124,9 @@ namespace Fluxzy.Core
                 return;
             }
 
-            var existingSetting = await GetSystemProxySetting().ConfigureAwait(false);
-
-            if (existingSetting.Enabled) {
-                existingSetting.Enabled = false;
-                await _systemProxySetter.ApplySetting(existingSetting).ConfigureAwait(false);
-            }
+            // No pending state: UnRegister is a no-op. This matters for the ProcessExit
+            // handler that fires after an explicit UnRegister — touching the registry
+            // here would corrupt the already-restored user setting.
         }
         
         private IPAddress GetConnectableIpAddr(IPAddress address)

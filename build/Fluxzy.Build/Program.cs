@@ -124,7 +124,7 @@ namespace Fluxzy.Build
                 DependsOn(Targets.RestoreTests, Targets.BuildTests),
                 async () => {
                     await RunAsync("dotnet",
-                        "test test/Fluxzy.Tests --collect:\"XPlat Code Coverage\" --no-build");
+                        "test test/Fluxzy.Tests --collect:\"XPlat Code Coverage\" --no-build --blame-hang --blame-hang-timeout 3m");
                 });
         }
 
@@ -379,7 +379,7 @@ namespace Fluxzy.Build
             Target(Targets.FluxzyCliPublish, DependsOn(Targets.InstallTools, Targets.FluxzyCliPublishInternal),
                 async () => await CreateAndPushVersionedTag("-cli"));
 
-            // Build local CLI packages signed 
+            // Build local CLI packages signed
             Target(Targets.FluxzyCliPublishWithNote, DependsOn(Targets.FluxzyCliPublish),
                 async () => {
                     var publishHelper = await
@@ -387,7 +387,10 @@ namespace Fluxzy.Build
                             EnvironmentHelper.GetEvOrFail("REPOSITORY_OWNER"),
                             EnvironmentHelper.GetEvOrFail("REPOSITORY_NAME"));
 
-                    var assets = new DirectoryInfo(".artefacts/final/").EnumerateFiles("*.zip");
+                    // Upload both .zip and .tar.gz assets
+                    var assets = new DirectoryInfo(".artefacts/final/")
+                        .EnumerateFiles()
+                        .Where(f => f.Extension == ".zip" || f.Name.EndsWith(".tar.gz"));
 
                     var tag = "v" + await GetRunningVersion();
 

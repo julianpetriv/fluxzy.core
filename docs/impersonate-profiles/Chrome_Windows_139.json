@@ -1,0 +1,101 @@
+{
+  "networkSettings": {
+    "ja3FingerPrint": "772,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,23-16-17613-51-65281-45-27-5-43-13-35-65037-0-18-11-10,4588-29-23-24,0",
+    "greaseMode": true,
+    "overrideClientExtensionsValues": null,
+    "signatureAlgorithms": [
+      1027,
+      2052,
+      1025,
+      1283,
+      2053,
+      1281,
+      2054,
+      1537
+    ],
+    "earlySharedGroups": [
+      27242,
+      4588,
+      29
+    ]
+  },
+  "h2Settings": {
+    "settings": [
+      {
+        "identifier": 1,
+        "value": 65536
+      },
+      {
+        "identifier": 2,
+        "value": 0
+      },
+      {
+        "identifier": 4,
+        "value": 6291456
+      },
+      {
+        "identifier": 6,
+        "value": 262144
+      }
+    ],
+    "removeDefaultValues": true,
+    "initialWindowSize": 15728640
+  },
+  "headers": [
+    {
+      "name": "sec-ch-ua",
+      "value": "\"Not;A=Brand\";v=\"99\", \"Google Chrome\";v=\"139\", \"Chromium\";v=\"139\""
+    },
+    {
+      "name": "sec-ch-ua-mobile",
+      "value": "?0"
+    },
+    {
+      "name": "sec-ch-ua-platform",
+      "value": "\"Windows\""
+    },
+    {
+      "name": "Upgrade-Insecure-Requests",
+      "value": "1"
+    },
+    {
+      "name": "User-Agent",
+      "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    },
+    {
+      "name": "Accept",
+      "value": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+      "skipIfExists": true
+    },
+    {
+      "name": "Sec-Fetch-Site",
+      "value": "none"
+    },
+    {
+      "name": "Sec-Fetch-Mode",
+      "value": "navigate"
+    },
+    {
+      "name": "Sec-Fetch-User",
+      "value": "?1"
+    },
+    {
+      "name": "Sec-Fetch-Dest",
+      "value": "document"
+    },
+    {
+      "name": "Accept-Encoding",
+      "value": "gzip, deflate, br, zstd",
+      "skipIfExists": true
+    },
+    {
+      "name": "Accept-language",
+      "value": "en-US,en;q=0.9",
+      "skipIfExists": true
+    },
+    {
+      "name": "Priority",
+      "value": "u=0, i"
+    }
+  ]
+}

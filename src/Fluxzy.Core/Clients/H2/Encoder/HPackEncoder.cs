@@ -2,6 +2,7 @@
 
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using Fluxzy.Clients.H2.Encoder.HPack;
 using Fluxzy.Clients.H2.Encoder.Utils;
 
@@ -41,8 +42,27 @@ namespace Fluxzy.Clients.H2.Encoder
         {
             var offset = 0;
 
-            foreach (var headerField in Http11Parser.Read(headerContent, isHttps)) {
-                offset += Encode(headerField, buffer.Slice(offset));
+            // Hot path: stream parse + encode in a single pass via a ref-struct enumerator,
+            // avoiding the List<HeaderField> and iterator-state-machine allocations that used
+            // to dominate the per-request cost.
+            var reader = new Http11HeaderReader(headerContent, isHttps);
+
+            while (reader.MoveNext()) {
+                offset += Encode(reader.Current, buffer.Slice(offset));
+            }
+
+            return buffer.Slice(0, offset);
+        }
+
+        /// <summary>
+        ///     Encode a list of header fields directly (used for HTTP trailers which have no status/request line).
+        /// </summary>
+        public ReadOnlySpan<byte> EncodeFields(IList<HeaderField> fields, Span<byte> buffer)
+        {
+            var offset = 0;
+
+            foreach (var field in fields) {
+                offset += Encode(field, buffer.Slice(offset));
             }
 
             return buffer.Slice(0, offset);

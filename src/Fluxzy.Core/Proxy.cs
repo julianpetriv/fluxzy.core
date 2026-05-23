@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Fluxzy.Certificates;
@@ -15,11 +16,15 @@ using Fluxzy.Clients.Ssl;
 using Fluxzy.Clients.Ssl.BouncyCastle;
 using Fluxzy.Clients.Ssl.SChannel;
 using Fluxzy.Core;
+using Fluxzy.Logging;
+using Fluxzy.Misc;
 using Fluxzy.Misc.ResizableBuffers;
-using Fluxzy.Misc.Traces;
+using Fluxzy.Rules;
 using Fluxzy.Rules.Actions;
 using Fluxzy.Rules.Filters;
 using Fluxzy.Writers;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Fluxzy
 {
@@ -35,8 +40,11 @@ namespace Fluxzy
 
         private readonly ProxyOrchestrator _proxyOrchestrator;
         private readonly ProxyRuntimeSetting _runTimeSetting;
+        private readonly ILogger<Proxy> _logger;
+        private long _nextProxyConnectionId;
         private volatile int _currentConcurrentCount;
         private bool _disposed;
+        private List<ProxyDiscoveryService>? _discoveryServices;
         private bool _halted;
         private Task? _loopTask;
         private bool _started;
@@ -48,14 +56,17 @@ namespace Fluxzy
         /// <param name="startupSetting">The startup Setting</param>
         /// <param name="tcpConnectionProvider">The tcp connection provider, if null the default is used</param>
         /// <param name="proxyAuthenticationMethod">Use this authentication method instead of the one provided in FluxzySetting</param>
+        /// <param name="loggerFactory">Optional logger factory. When null, no logs are emitted.</param>
         public Proxy(
             FluxzySetting startupSetting,
             ITcpConnectionProvider? tcpConnectionProvider = null,
-            ProxyAuthenticationMethod? proxyAuthenticationMethod = null)
+            ProxyAuthenticationMethod? proxyAuthenticationMethod = null,
+            ILoggerFactory? loggerFactory = null)
             : this(startupSetting,
                 new CertificateProvider(startupSetting.CaCertificate, new InMemoryCertificateCache()),
                 new DefaultCertificateAuthorityManager(), tcpConnectionProvider,
-                proxyAuthenticationMethod: proxyAuthenticationMethod)
+                proxyAuthenticationMethod: proxyAuthenticationMethod,
+                loggerFactory: loggerFactory)
         {
         }
 
@@ -72,6 +83,7 @@ namespace Fluxzy
         /// <param name="dnsSolver">Add a custom DNS solver</param>
         /// <param name="externalCancellationSource">An external cancellation token</param>
         /// <param name="proxyAuthenticationMethod">Use this authentication method instead of the one provided in FluxzySetting</param>
+        /// <param name="loggerFactory">Optional logger factory. When null, no logs are emitted.</param>
         /// <exception cref="ArgumentNullException"></exception>
         public Proxy(
             FluxzySetting startupSetting,
@@ -82,7 +94,8 @@ namespace Fluxzy
             FromIndexIdProvider? idProvider = null,
             IDnsSolver? dnsSolver = null,
             CancellationTokenSource? externalCancellationSource = null,
-            ProxyAuthenticationMethod? proxyAuthenticationMethod = null)
+            ProxyAuthenticationMethod? proxyAuthenticationMethod = null,
+            ILoggerFactory? loggerFactory = null)
         {
             _certificateProvider = certificateProvider;
             _externalCancellationSource = externalCancellationSource;
@@ -93,14 +106,16 @@ namespace Fluxzy
             _downStreamConnectionProvider =
                 new DownStreamConnectionProvider(StartupSetting.BoundPoints);
 
-            var secureConnectionManager = new SecureConnectionUpdater(certificateProvider);
+            var secureConnectionManager = new SecureConnectionUpdater(
+                certificateProvider, startupSetting.ServeH2,
+                (loggerFactory ?? NullLoggerFactory.Instance).CreateLogger<SecureConnectionUpdater>());
 
             if (StartupSetting.ArchivingPolicy.Type == ArchivingPolicyType.Directory
                 && StartupSetting.ArchivingPolicy.Directory != null) {
                 Directory.CreateDirectory(StartupSetting.ArchivingPolicy.Directory);
 
                 Writer = new DirectoryArchiveWriter(StartupSetting.ArchivingPolicy.Directory,
-                    StartupSetting.SaveFilter);
+                    StartupSetting.SaveFilter, StartupSetting);
             }
 
             if (StartupSetting.ArchivingPolicy.Type == ArchivingPolicyType.None) {
@@ -114,12 +129,15 @@ namespace Fluxzy
             var poolBuilder = new PoolBuilder(
                 new RemoteConnectionBuilder(ITimingProvider.Default, sslConnectionBuilder),
                 ITimingProvider.Default,
-                Writer, dnsSolver ?? new DefaultDnsResolver());
-
+                Writer, dnsSolver ?? new DefaultDnsResolver(),
+                loggerFactory);
+            
             ExecutionContext = new ProxyExecutionContext(startupSetting);
 
             _runTimeSetting = new ProxyRuntimeSetting(startupSetting, ExecutionContext, tcpConnectionProvider1,
-                Writer, IdProvider, userAgentProvider);
+                Writer, IdProvider, userAgentProvider, loggerFactory, InstanceId);
+
+            _logger = _runTimeSetting.GetLogger<Proxy>();
 
             proxyAuthenticationMethod ??= ProxyAuthenticationMethodBuilder.Create(startupSetting.ProxyAuthentication);
 
@@ -162,6 +180,14 @@ namespace Fluxzy
         public string SessionIdentifier { get; } = DateTime.Now.ToString("yyyyMMdd-HHmmss");
 
         /// <summary>
+        ///     A unique identifier for this proxy instance. Emitted as the
+        ///     <c>fluxzy.proxy.instance_id</c> tag on every activity produced by
+        ///     <c>Fluxzy.Core</c>, so OpenTelemetry consumers can correlate or
+        ///     filter activities to a specific Proxy when several run in-process.
+        /// </summary>
+        public Guid InstanceId { get; } = Guid.NewGuid();
+
+        /// <summary>
         ///     Gets the collection of IP endpoints associated with this proxy. Returns null if the proxy is not started.
         /// </summary>
         /// <remarks>
@@ -177,6 +203,24 @@ namespace Fluxzy
         {
             InternalDispose();
 
+            // Dispose discovery services
+            if (_discoveryServices != null)
+            {
+                foreach (var service in _discoveryServices)
+                {
+                    try
+                    {
+                        await service.DisposeAsync().ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Ignore disposal errors for discovery services
+                    }
+                }
+
+                _discoveryServices = null;
+            }
+
             try {
                 if (_loopTask != null) {
                     await _loopTask.ConfigureAwait(false); // Wait for main loop to end
@@ -189,7 +233,7 @@ namespace Fluxzy
                 }
             }
             catch (Exception) {
-                // Loop task exception 
+                // Loop task exception
             }
         }
 
@@ -219,6 +263,16 @@ namespace Fluxzy
             }
         }
 
+        private static string SafeRemoteEndPoint(TcpClient client)
+        {
+            try {
+                return client.Client.RemoteEndPoint?.ToString() ?? string.Empty;
+            }
+            catch {
+                return string.Empty;
+            }
+        }
+
         private async void ProcessingConnection(TcpClient client)
         {
             var currentCount = Interlocked.Increment(ref _currentConcurrentCount);
@@ -239,6 +293,15 @@ namespace Fluxzy
                     var closeImmediately = FluxzySharedSetting.OverallMaxConcurrentConnections <
                                            currentCount;
 
+                    var proxyConnectionId = Interlocked.Increment(ref _nextProxyConnectionId);
+                    var remoteEp = client.Client.RemoteEndPoint?.ToString() ?? string.Empty;
+                    var localEp = client.Client.LocalEndPoint?.ToString() ?? string.Empty;
+
+                    using var connectionScope = FluxzyLoggerScopes.BeginConnectionScope(
+                        _logger, proxyConnectionId, remoteEp, localEp);
+
+                    FluxzyLogEvents.ClientConnectionAccepted(_logger, currentCount, closeImmediately);
+
                     await _proxyOrchestrator!.Operate(client, buffer, closeImmediately, _proxyHaltTokenSource.Token)
                                              .ConfigureAwait(false);
                 }
@@ -247,13 +310,8 @@ namespace Fluxzy
                 }
             }
             catch (Exception ex) {
-                // We ignore any parsing errors that may block the proxy
-                // TODO : escalate from Serilog To Here
-
-                if (D.EnableTracing) {
-                    var message = $"Processing error {client.Client.RemoteEndPoint}";
-                    D.TraceException(ex, message);
-                }
+                var remote = SafeRemoteEndPoint(client);
+                FluxzyLogEvents.ConnectionProcessingError(_logger, ex, remote);
             }
             finally {
                 Interlocked.Decrement(ref _currentConcurrentCount);
@@ -290,7 +348,166 @@ namespace Fluxzy
 
             EndPoints = endPoints;
 
+            if (Writer is DirectoryArchiveWriter directoryWriter) {
+                directoryWriter.SetResolvedEndPoints(endPoints);
+            }
+
+            if (StartupSetting.EnableDiscoveryService) {
+                StartDiscoveryServices(endPoints);
+            }
+
             return endPoints;
+        }
+
+        private void StartDiscoveryServices(IReadOnlyCollection<IPEndPoint> endPoints)
+        {
+            var lanAddresses = endPoints
+                .Where(ep => ep.AddressFamily == AddressFamily.InterNetwork)
+                .Where(ep => !IPAddress.IsLoopback(ep.Address))
+                .Select(ep => (Address: ep.Address, Port: ep.Port))
+                .Distinct()
+                .ToList();
+
+            if (lanAddresses.Count == 0)
+                return;
+
+            lanAddresses = lanAddresses.SelectMany(s => {
+                if (s.Address.Equals(IPAddress.Any)) {
+
+                    var allIPv4 = IpUtility.GetAllLocalIps()
+                                           .Where(i => i.AddressFamily == AddressFamily.InterNetwork)
+                                           .Where(ep => !IPAddress.IsLoopback(ep))
+                                           .Select(i => i.MapToIPv4());
+
+                    return allIPv4.Select(ip => (Address: ip, Port: s.Port));
+                }
+
+
+                if (s.Address.Equals(IPAddress.IPv6Any)) {
+
+                    var allIpV6 = IpUtility.GetAllLocalIps()
+                                           .Where(ep => !IPAddress.IsLoopback(ep))
+                                           .Where(i => i.AddressFamily == AddressFamily.InterNetworkV6);
+
+                    return allIpV6.Select(ip => (Address: ip, Port: s.Port));
+                }
+
+                return new[] { s };
+
+            }).ToList();
+
+
+            var startupSettingString = BuildStartupSettingString();
+            var fluxzyVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
+
+            _discoveryServices = new List<ProxyDiscoveryService>();
+
+            foreach (var (address, port) in lanAddresses)
+            {
+                var options = new MdnsAnnouncerOptions
+                {
+                    ServiceName = "Fluxzy",
+                    ProxyPort = port,
+                    HostIpAddress = address.ToString(),
+                    FluxzyVersion = fluxzyVersion,
+                    FluxzyStartupSetting = startupSettingString
+                };
+
+                try
+                {
+                    var service = new ProxyDiscoveryService(options);
+                    service.StartAsync().GetAwaiter().GetResult();
+                    _discoveryServices.Add(service);
+                }
+                catch
+                {
+                    // Ignore failures for individual addresses - mDNS is optional
+                }
+            }
+        }
+
+        private string BuildStartupSettingString()
+        {
+            var parts = new List<string>();
+
+            if (StartupSetting.GlobalSkipSslDecryption)
+                parts.Add("NoSSL");
+
+            if (StartupSetting.UseBouncyCastle)
+                parts.Add("BC");
+
+            if (StartupSetting.ServeH2)
+                parts.Add("H2");
+
+            return parts.Count > 0 ? string.Join(",", parts) : "Default";
+        }
+
+        /// <summary>
+        /// Updates the alteration rules at runtime without stopping the proxy.
+        /// New rules apply to exchanges that begin processing after this call completes.
+        /// In-flight exchanges continue with their existing rules.
+        /// Fixed rules (SSL skip, CA mount, welcome page) are automatically preserved.
+        /// </summary>
+        /// <param name="rules">The new set of alteration rules</param>
+        /// <exception cref="InvalidOperationException">If proxy not started or disposed</exception>
+        /// <exception cref="ArgumentNullException">If rules is null</exception>
+        /// <exception cref="RuleInitializationException">If rule initialization fails</exception>
+        public void UpdateRules(IEnumerable<Rule> rules)
+        {
+            if (rules == null) {
+                throw new ArgumentNullException(nameof(rules));
+            }
+
+            ValidateProxyState();
+
+            _runTimeSetting.UpdateRules(rules);
+        }
+
+        /// <summary>
+        /// Updates the alteration rules at runtime using a configuration action.
+        /// Provides a fluent API for configuring rules similar to FluxzySetting setup.
+        /// </summary>
+        /// <param name="configureRules">Action to configure rules on a temporary FluxzySetting</param>
+        /// <exception cref="InvalidOperationException">If proxy not started or disposed</exception>
+        /// <exception cref="ArgumentNullException">If configureRules is null</exception>
+        /// <exception cref="RuleInitializationException">If rule initialization fails</exception>
+        public void UpdateRules(Action<FluxzySetting> configureRules)
+        {
+            if (configureRules == null) {
+                throw new ArgumentNullException(nameof(configureRules));
+            }
+
+            ValidateProxyState();
+
+            // Create temporary setting to collect rules
+            var tempSetting = new FluxzySetting();
+            configureRules(tempSetting);
+
+            _runTimeSetting.UpdateRules(tempSetting.AlterationRules);
+        }
+
+        /// <summary>
+        /// Gets a read-only snapshot of currently active alteration rules.
+        /// Does not include fixed rules (SSL skip, CA mount, welcome page).
+        /// </summary>
+        /// <returns>Read-only collection of active alteration rules</returns>
+        /// <exception cref="InvalidOperationException">If proxy not started</exception>
+        public IReadOnlyCollection<Rule> GetActiveRules()
+        {
+            ValidateProxyState();
+
+            return _runTimeSetting.GetCurrentAlterationRules();
+        }
+
+        private void ValidateProxyState()
+        {
+            if (_disposed) {
+                throw new InvalidOperationException("Proxy has been disposed");
+            }
+
+            if (!_started) {
+                throw new InvalidOperationException("Proxy has not been started. Call Run() first.");
+            }
         }
 
         private void InternalDispose()

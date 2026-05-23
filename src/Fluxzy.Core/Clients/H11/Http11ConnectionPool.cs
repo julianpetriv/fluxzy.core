@@ -2,14 +2,17 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Security;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Fluxzy.Core;
 using Fluxzy.Misc.ResizableBuffers;
 using Fluxzy.Writers;
+using Org.BouncyCastle.Tls;
 
 namespace Fluxzy.Clients.H11
 {
@@ -21,8 +24,6 @@ namespace Fluxzy.Clients.H11
         private static readonly List<SslApplicationProtocol> Http11Protocols = new() { SslApplicationProtocol.Http11 };
         private readonly RealtimeArchiveWriter _archiveWriter;
         private readonly DnsResolutionResult _resolutionResult;
-
-        private readonly H1Logger _logger;
 
         private readonly Channel<Http11ProcessingState> _pendingConnections;
         
@@ -52,8 +53,6 @@ namespace Fluxzy.Clients.H11
                     SingleWriter = false
             });
 
-            _logger = new H1Logger(authority);
-
             ITimingProvider.Default.Instant();
         }
 
@@ -65,11 +64,6 @@ namespace Fluxzy.Clients.H11
         {
         }
 
-        public ValueTask<bool> CheckAlive()
-        {
-            return new ValueTask<bool>(true);
-        }
-
         public async ValueTask Send(
             Exchange exchange, IDownStreamPipe downstreamPipe, RsBuffer buffer, ExchangeScope exchangeScope,
             CancellationToken cancellationToken)
@@ -79,9 +73,6 @@ namespace Fluxzy.Clients.H11
             exchange.HttpVersion = "HTTP/1.1";
 
             try {
-                _logger.Trace(exchange, "Begin wait for authority slot");
-                _logger.Trace(exchange.Id, "Acquiring slot");
-
                 var requestDate = _timingProvider.Instant();
 
                 while (_pendingConnections.Reader.TryRead(out var state)) {
@@ -95,14 +86,11 @@ namespace Fluxzy.Clients.H11
                     }
 
                     exchange.Connection = state.Connection;
-                    _logger.Trace(exchange.Id, () => $"Recycling connection : {exchange.Connection.Id}");
-
+                    exchange.RecycledConnection = true;
                     break;
                 }
 
                 if (exchange.Connection == null) {
-                    _logger.Trace(exchange.Id, () => "New connection request");
-
                     var openingResult =
                         await _remoteConnectionBuilder.OpenConnectionToRemote(
                             exchange, _resolutionResult , Http11Protocols,
@@ -118,11 +106,11 @@ namespace Fluxzy.Clients.H11
 
                     if (_archiveWriter != null!)
                         _archiveWriter.Update(exchange.Connection, cancellationToken);
-
-                    _logger.Trace(exchange.Id, () => $"New connection obtained: {exchange.Connection.Id}");
                 }
 
-                var poolProcessing = new Http11PoolProcessing(_logger);
+                var poolProcessing = new Http11PoolProcessing(
+                    _proxyRuntimeSetting.ExpectContinueTimeout,
+                    _proxyRuntimeSetting.GetLogger<Http11PoolProcessing>());
 
                 try {
                     await poolProcessing.Process(exchange, buffer, exchangeScope, cancellationToken)
@@ -130,9 +118,7 @@ namespace Fluxzy.Clients.H11
 
                     if (exchange.Response.Header != null)
                         exchange.Connection.TimeoutIdleSeconds = exchange.Response.Header.TimeoutIdleSeconds; 
-
-                    _logger.Trace(exchange.Id, () => "[Process] return");
-
+                    
                     var lastUsed = _timingProvider.Instant(); 
 
                     void OnExchangeCompleteFunction(Task<bool> completeTask)
@@ -148,8 +134,6 @@ namespace Fluxzy.Clients.H11
                             exchange.Metrics.ResponseBodyEnd = ITimingProvider.Default.Instant();
 
                         if (completeTask.Exception != null && completeTask.Exception.InnerExceptions.Any()) {
-                            _logger.Trace(exchange.Id, () => $"Complete on error {completeTask.Exception.GetType()} : {completeTask.Exception.Message}");
-
                             foreach (var exception in completeTask.Exception.InnerExceptions) {
                                 exchange.Errors.Add(new Error("Error while reading response", exception));
                             }
@@ -159,13 +143,10 @@ namespace Fluxzy.Clients.H11
                             if (_pendingConnections.Writer.TryWrite(
                                     new Http11ProcessingState(exchange.Connection, lastUsed)))
                             {
-                                _logger.Trace(exchange.Id, () => "Complete on success, recycling connection ...");
                                 return;
                             }
                         }
                         else {
-                            _logger.Trace(exchange.Id, () => "Complete on success, closing connection ...");
-
                             // should close connection 
                         }
                         
@@ -176,15 +157,34 @@ namespace Fluxzy.Clients.H11
                 }
                 catch (Exception ex) {
 
-                    if (ex is ConnectionCloseException)
-                    {
-                        if (exchange.Connection.ReadStream != null)
+                    // Any "connection is dead" signal must dispose the read stream and
+                    // null the connection so the next attempt opens a fresh one. The
+                    // original code only handled ConnectionCloseException, leaking the
+                    // read stream when TlsFatalAlert / IOException / SocketException
+                    // bubbled through unconverted (e.g. from the request-write path).
+                    var deadConnSignal = ex is ConnectionCloseException
+                        || ex is TlsFatalAlert
+                        || ex is IOException
+                        || ex is SocketException;
+
+                    if (deadConnSignal) {
+                        if (exchange.Connection?.ReadStream != null)
                             await exchange.Connection.ReadStream.DisposeAsync();
 
-                        exchange.Connection = null; 
+                        exchange.Connection = null;
                     }
 
-                    _logger.Trace(exchange.Id, () => $"Processing error {ex}");
+                    // Recycled connection that died before producing any response byte —
+                    // safe to relaunch on a fresh connection regardless of whether the
+                    // failure happened on the request write or the response read. The
+                    // recycled-and-no-response gate keeps a fresh-connection failure
+                    // (server closes immediately) flowing through as 528.
+                    if (deadConnSignal
+                        && !(ex is ConnectionCloseException)
+                        && exchange.RecycledConnection
+                        && exchange.Metrics.ResponseHeaderStart == default) {
+                        throw new ConnectionCloseException("Relaunch");
+                    }
 
                     throw;
                 }

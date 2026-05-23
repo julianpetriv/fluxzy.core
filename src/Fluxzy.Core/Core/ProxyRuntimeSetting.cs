@@ -12,12 +12,15 @@ using Fluxzy.Rules;
 using Fluxzy.Rules.Actions;
 using Fluxzy.Rules.Filters;
 using Fluxzy.Writers;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Fluxzy.Core
 {
     internal class ProxyRuntimeSetting
     {
-        private List<Rule>? _effectiveRules;
+        private volatile PartitionedRules? _partitionedRules;
+        private readonly object _ruleUpdateLock = new object();
 
         private ProxyRuntimeSetting()
         {
@@ -26,6 +29,7 @@ namespace Fluxzy.Core
             ExecutionContext = null!;
             CertificateValidationCallback = null!;
             ActionMapping = new SetUserAgentActionMapping(null);
+            LoggerFactory = NullLoggerFactory.Instance;
         }
 
         public ProxyRuntimeSetting(
@@ -34,7 +38,9 @@ namespace Fluxzy.Core
             ITcpConnectionProvider tcpConnectionProvider,
             RealtimeArchiveWriter archiveWriter,
             IIdProvider idProvider,
-            IUserAgentInfoProvider? userAgentProvider)
+            IUserAgentInfoProvider? userAgentProvider,
+            ILoggerFactory? loggerFactory = null,
+            Guid proxyInstanceId = default)
         {
             ExecutionContext = null!;
             CertificateValidationCallback = null!;
@@ -45,7 +51,10 @@ namespace Fluxzy.Core
             IdProvider = idProvider;
             UserAgentProvider = userAgentProvider;
             ConcurrentConnection = startupSetting.ConnectionPerHost;
+            ExpectContinueTimeout = startupSetting.ExpectContinueTimeout;
             ActionMapping = new SetUserAgentActionMapping(startupSetting.UserAgentActionConfigurationFile);
+            LoggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
+            ProxyInstanceId = proxyInstanceId;
         }
 
         internal static ProxyRuntimeSetting CreateDefault => new() {
@@ -73,15 +82,28 @@ namespace Fluxzy.Core
 
         public int TimeOutSecondsUnusedConnection { get; set; } = 4;
 
+        /// <summary>
+        ///     Maximum time fluxzy waits for an upstream `100 Continue` (or a
+        ///     final response) before falling back to sending the request body.
+        ///     Matches .NET's default `Expect100ContinueTimeout` of 1 second.
+        /// </summary>
+        public TimeSpan ExpectContinueTimeout { get; set; } = TimeSpan.FromSeconds(1);
+
         public IIdProvider IdProvider { get; set; } = new FromIndexIdProvider(0, 0);
 
         public IUserAgentInfoProvider? UserAgentProvider { get; }
+
+        public ILoggerFactory LoggerFactory { get; }
+
+        public ILogger<T> GetLogger<T>() => LoggerFactory.CreateLogger<T>();
 
         public VariableContext VariableContext { get; } = new();
 
         public HashSet<IPEndPoint> EndPoints { get; set; } = new();
 
         public int ProxyListenPort { get; set; }
+
+        public Guid ProxyInstanceId { get; }
 
         public ProxyConfiguration?  GetInternalProxyAuthentication()
         {
@@ -124,7 +146,69 @@ namespace Fluxzy.Core
                 rule.Filter.Init(startupContext);
             }
 
-            _effectiveRules ??= activeRules;
+            if (_partitionedRules == null) {
+                _partitionedRules = new PartitionedRules(activeRules.AsReadOnly());
+            }
+        }
+
+        /// <summary>
+        /// Updates the active alteration rules at runtime. Thread-safe.
+        /// Fixed rules (skip SSL, CA mount, welcome page) are automatically included.
+        /// </summary>
+        /// <param name="newAlterationRules">New alteration rules to apply</param>
+        /// <exception cref="InvalidOperationException">If Init() not called yet</exception>
+        /// <exception cref="RuleInitializationException">If rule initialization fails</exception>
+        public void UpdateRules(IEnumerable<Rule> newAlterationRules)
+        {
+            if (_partitionedRules == null) {
+                throw new InvalidOperationException("Rules not initialized. Call Init() first.");
+            }
+
+            lock (_ruleUpdateLock) {
+                try {
+                    // Combine new alteration rules with fixed rules
+                    var activeRules = newAlterationRules
+                                        .Concat(StartupSetting.FixedRules())
+                                        .ToList();
+
+                    var startupContext = new StartupContext(StartupSetting, VariableContext, ArchiveWriter);
+
+                    // Initialize all new rules
+                    foreach (var rule in activeRules) {
+                        rule.Action.Init(startupContext);
+                        rule.Filter.Init(startupContext);
+                    }
+
+                    // Atomic swap - thread-safe visibility
+                    var newPartitioned = new PartitionedRules(activeRules.AsReadOnly());
+                    System.Threading.Interlocked.Exchange(ref _partitionedRules, newPartitioned);
+                }
+                catch (Exception ex) {
+                    throw new RuleInitializationException("Failed to update rules: " + ex.Message, ex);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets current alteration rules (excluding fixed rules).
+        /// </summary>
+        public IReadOnlyCollection<Rule> GetCurrentAlterationRules()
+        {
+            var current = _partitionedRules;
+
+            if (current == null) {
+                return Array.Empty<Rule>();
+            }
+
+            // Identify fixed rules by action type
+            var fixedRuleActions = StartupSetting.FixedRules()
+                                                 .Select(r => r.Action.GetType())
+                                                 .ToHashSet();
+
+            return current.AllRules
+                .Where(r => !fixedRuleActions.Contains(r.Action.GetType()))
+                .ToList()
+                .AsReadOnly();
         }
 
         public async ValueTask<ExchangeContext> EnforceRules(
@@ -132,17 +216,10 @@ namespace Fluxzy.Core
             Connection? connection = null, Exchange? exchange = null)
         {
             try {
-                foreach (var rule in _effectiveRules!)
-                {
-                    if (rule.Action.ActionScope != filterScope &&
-                        rule.Action.ActionScope != FilterScope.OutOfScope &&
-                        !(rule.Action.ActionScope == FilterScope.CopySibling &&
-                          rule.Action is MultipleScopeAction multipleScopeAction &&
-                          multipleScopeAction.RunScope == filterScope))
-                    {
-                        continue;
-                    }
+                var rules = _partitionedRules!.GetRulesForScope(filterScope);
 
+                foreach (var rule in rules)
+                {
                     await rule.Enforce(
                         context, exchange, connection, filterScope,
                         ExecutionContext?.BreakPointManager!).ConfigureAwait(false);
@@ -160,7 +237,7 @@ namespace Fluxzy.Core
                 if (e is RuleExecutionFailureException) {
                     throw;
                 }
-                
+
                 throw new RuleExecutionFailureException("Error while evaluating rules: " + e.Message, e);
             }
 

@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -23,8 +24,12 @@ namespace Fluxzy.Clients.Ssl.BouncyCastle
         {
             var crypto = new FluxzyCrypto();
 
+            var skipRemoteCertificateValidation = builderOptions.ContextSkipRemoteCertificateValidation;
+
             var tlsAuthentication = 
-                new FluxzyTlsAuthentication(crypto, builderOptions.GetBouncyCastleClientCertificateInfo());
+                new FluxzyTlsAuthentication(crypto, 
+                    builderOptions.GetBouncyCastleClientCertificateInfo(),
+                    builderOptions.TargetHost, skipRemoteCertificateValidation);
 
 
             var fingerPrintEnforcer = new FingerPrintTlsExtensionsEnforcer();
@@ -60,7 +65,13 @@ namespace Fluxzy.Clients.Ssl.BouncyCastle
             }
             catch (Exception ex)
             {
-                throw new ClientErrorException(0, $"Handshake with {builderOptions.TargetHost} has failed", ex.Message);
+                var networkErrorCode = MapTlsAlert(ex);
+
+                throw new ClientErrorException(0,
+                    $"Handshake with {builderOptions.TargetHost} has failed",
+                    innerMessageException: ex.Message,
+                    innerException: ex,
+                    networkErrorCode: networkErrorCode);
             }
 
             var keyInfos =
@@ -74,13 +85,43 @@ namespace Fluxzy.Clients.Ssl.BouncyCastle
                 networkStream = (NetworkStream) disposeEventNotifierStream.InnerStream;
             }
 
+            var exportCertificate =
+                builderOptions.AdvancedTlsSettings?.ExportCertificateInSslInfo ?? false;
+
             var connection =
-                new SslConnection(protocol.Stream, new SslInfo(protocol), protocol.GetApplicationProtocol(),
+                new SslConnection(protocol.Stream, new SslInfo(protocol, exportCertificate), protocol.GetApplicationProtocol(),
                     networkStream, innerStream as DisposeEventNotifierStream) {
                     NssKey = keyInfos
                 };
 
             return connection;
+        }
+
+        internal static string MapTlsAlert(Exception ex)
+        {
+            // Walk the inner-exception chain looking for a TlsFatalAlert raised by
+            // either the BC stack itself or our FluxzyTlsAuthentication validator.
+            for (var current = ex; current != null; current = current.InnerException) {
+                if (current is Org.BouncyCastle.Tls.TlsFatalAlert alert) {
+                    return alert.AlertDescription switch {
+                        Org.BouncyCastle.Tls.AlertDescription.certificate_expired
+                            => NetworkErrorCodes.TlsCertExpired,
+                        Org.BouncyCastle.Tls.AlertDescription.bad_certificate
+                            => NetworkErrorCodes.TlsCertHostnameMismatch,
+                        Org.BouncyCastle.Tls.AlertDescription.unknown_ca
+                            => NetworkErrorCodes.TlsCertUntrusted,
+                        Org.BouncyCastle.Tls.AlertDescription.certificate_unknown
+                            => NetworkErrorCodes.TlsCertInvalid,
+                        Org.BouncyCastle.Tls.AlertDescription.certificate_required
+                            => NetworkErrorCodes.TlsCertInvalid,
+                        Org.BouncyCastle.Tls.AlertDescription.certificate_revoked
+                            => NetworkErrorCodes.TlsCertInvalid,
+                        _ => NetworkErrorCodes.TlsHandshakeFailure
+                    };
+                }
+            }
+
+            return NetworkErrorCodes.TlsHandshakeFailure;
         }
     }
 }

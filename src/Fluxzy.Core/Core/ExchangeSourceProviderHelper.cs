@@ -12,14 +12,15 @@ namespace Fluxzy.Core
             ProxyAuthenticationMethod proxyAuthenticationMethod, IExchangeContextBuilder contextBuilder)
         {
             if (!setting.ReverseMode)
-                return new FromProxyConnectSourceProvider(
+                return new ProtocolDetectingSourceProvider(
                     secureConnectionUpdater, idProvider,
                     proxyAuthenticationMethod, contextBuilder);
             
             if (setting.ReverseModePlainHttp)
                 return new ReverseProxyPlainExchangeSourceProvider(idProvider, setting.ReverseModeForcedPort, contextBuilder);
 
-            return new ReverseProxyExchangeSourceProvider(certificateProvider, idProvider, setting.ReverseModeForcedPort, contextBuilder);
+            return new ReverseProxyExchangeSourceProvider(certificateProvider, idProvider,
+                setting.ReverseModeForcedPort, setting.ServeH2, contextBuilder);
         }
     }
 }

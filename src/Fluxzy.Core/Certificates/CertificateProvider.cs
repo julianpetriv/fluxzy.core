@@ -17,9 +17,11 @@ namespace Fluxzy.Certificates
     {
         private readonly ICertificateCache _certCache;
         private readonly ConcurrentDictionary<string, Lazy<byte[]>> _certificateRepository = new();
-        private readonly ECDsa _defaultEcdsaKeyEngine = ECDsa.Create()!;
 
-        private readonly RSA _defaultRsaKeyEngine = RSA.Create(2048);
+        // Exactly one of these engines is created, depending on the root CA key algorithm.
+        // It holds the (shared) private key reused by every generated leaf certificate.
+        private readonly ECDsa? _defaultEcdsaKeyEngine;
+        private readonly RSA? _defaultRsaKeyEngine;
 
         private readonly AsymmetricAlgorithm _privateKey;
         private readonly X509Certificate2 _rootCertificate;
@@ -37,11 +39,23 @@ namespace Fluxzy.Certificates
             _rootCertificate =
                 rootCertificate.GetX509Certificate();
 
-            var pk = _rootCertificate.PublicKey;
+            using (var rootEcdsaPublicKey = _rootCertificate.GetECDsaPublicKey()) {
+                if (rootEcdsaPublicKey != null) {
+                    // When the root CA is an ECDSA certificate, leaf certificates must also use an
+                    // ECDSA key: CertificateRequest.Create() requires the issuer and the request to
+                    // share the same public key OID. The leaf key is generated on a NIST curve that
+                    // tracks the root CA strength, but never below P-256: P-224 has no TLS 1.3
+                    // signature scheme (RFC 8446) and would be unusable for a server certificate.
+                    _defaultEcdsaKeyEngine = ECDsa.Create(GetLeafCurve(rootEcdsaPublicKey.KeySize));
+                    _privateKey = _defaultEcdsaKeyEngine;
+                }
+                else {
+                    _defaultRsaKeyEngine = RSA.Create(2048);
+                    _privateKey = _defaultRsaKeyEngine;
+                }
+            }
 
-            _privateKey = _rootCertificate.GetECDsaPublicKey() == null ? _defaultRsaKeyEngine : _defaultEcdsaKeyEngine;
-
-            // Warming : pre uild certicate 
+            // Warming : pre build certificate
             BuildCertificateForRootDomain(_rootCertificate, _privateKey, "domain.com");
         }
 
@@ -65,18 +79,27 @@ namespace Fluxzy.Certificates
             var cnName = GetRootDomain(rootDomain);
 
             if (_solveCertificateRepository.TryGetValue(cnName, out var value)) {
-                return value;
+                if (!IsCertificateExpired(value))
+                    return value;
+
+                // Certificate is expired, need to regenerate under lock
             }
 
             lock (string.Intern(cnName)) {
                 if (_solveCertificateRepository.TryGetValue(cnName, out value)) {
-                    return value;
+                    if (!IsCertificateExpired(value))
+                        return value;
+
+                    // Remove expired certificate from in-memory caches
+                    _solveCertificateRepository.TryRemove(cnName, out var expiredCert);
+                    _certificateRepository.TryRemove(cnName, out _);
+                    expiredCert?.Dispose();
                 }
 
                 var lazyCertificate =
                     _certificateRepository.GetOrAdd(cnName, new Lazy<byte[]>(() =>
                             _certCache.Load(_rootCertificate.SerialNumber!, cnName,
-                                rootDomain => BuildCertificateForRootDomain(_rootCertificate, _privateKey, rootDomain)),
+                                rD => BuildCertificateForRootDomain(_rootCertificate, _privateKey, rD)),
                         true));
 
                 var val = lazyCertificate.Value;
@@ -89,10 +112,30 @@ namespace Fluxzy.Certificates
             }
         }
 
+        /// <summary>
+        ///  Pick the NIST curve used for leaf ECDSA keys based on the root CA key strength.
+        ///  Clamped to a minimum of P-256 so the generated server certificates remain usable
+        ///  for TLS 1.3 (which defines ECDSA signature schemes for P-256/P-384/P-521 only).
+        /// </summary>
+        private static ECCurve GetLeafCurve(int rootKeySize)
+        {
+            return rootKeySize switch {
+                >= 521 => ECCurve.NamedCurves.nistP521,
+                >= 384 => ECCurve.NamedCurves.nistP384,
+                _ => ECCurve.NamedCurves.nistP256
+            };
+        }
+
+        private static bool IsCertificateExpired(X509Certificate2 certificate)
+        {
+            // Use a 1-minute buffer before actual expiration to avoid edge cases
+            return certificate.NotAfter <= DateTime.UtcNow.AddMinutes(1);
+        }
+
         public void Dispose()
         {
-            _defaultRsaKeyEngine.Dispose();
-            _defaultEcdsaKeyEngine.Dispose();
+            _defaultRsaKeyEngine?.Dispose();
+            _defaultEcdsaKeyEngine?.Dispose();
 
             foreach (var (_, certificate) in _solveCertificateRepository) {
                 certificate.Dispose();
@@ -147,9 +190,10 @@ namespace Fluxzy.Certificates
             RSA privateKey, string cnName)
         {
             var randomGenerator = new Random();
+            var isIpAddress = IPAddress.TryParse(cnName, out var ipAddress);
 
             var certificateRequest = new CertificateRequest(
-                $"CN=*.{cnName}",
+                isIpAddress ? $"CN={cnName}" : $"CN=*.{cnName}",
                 privateKey,
                 HashAlgorithmName.SHA256,
                 RSASignaturePadding.Pkcs1);
@@ -159,8 +203,14 @@ namespace Fluxzy.Certificates
             }
 
             var alternativeName = new SubjectAlternativeNameBuilder();
-            alternativeName.AddDnsName(cnName);
-            alternativeName.AddDnsName($"*.{cnName}");
+
+            if (isIpAddress) {
+                alternativeName.AddIpAddress(ipAddress!);
+            }
+            else {
+                alternativeName.AddDnsName(cnName);
+                alternativeName.AddDnsName($"*.{cnName}");
+            }
 
             certificateRequest.CertificateExtensions.Add(alternativeName.Build());
 
@@ -189,7 +239,10 @@ namespace Fluxzy.Certificates
 
             randomGenerator.NextBytes(buffer); // TODO check for collision here 
 
-            var notBefore = rootCertificate.NotBefore.AddSeconds(1);
+            // Start the leaf no earlier than the root CA, but never in the future: a freshly
+            // created root has a NotBefore set to "now", so adding any positive offset would
+            // make the leaf not-yet-valid until the wall clock catches up.
+            var notBefore = rootCertificate.NotBefore;
             var now = DateTime.Today;
             notBefore = now < notBefore ? notBefore : now;
 
@@ -208,9 +261,10 @@ namespace Fluxzy.Certificates
             ECDsa privateKey, string cnName)
         {
             var randomGenerator = new Random();
+            var isIpAddress = IPAddress.TryParse(cnName, out var ipAddress);
 
             var certificateRequest = new CertificateRequest(
-                $"CN=*.{cnName}",
+                isIpAddress ? $"CN={cnName}" : $"CN=*.{cnName}",
                 privateKey,
                 HashAlgorithmName.SHA256);
 
@@ -220,8 +274,13 @@ namespace Fluxzy.Certificates
 
             var alternativeName = new SubjectAlternativeNameBuilder();
 
-            alternativeName.AddDnsName(cnName);
-            alternativeName.AddDnsName($"*.{cnName}");
+            if (isIpAddress) {
+                alternativeName.AddIpAddress(ipAddress!);
+            }
+            else {
+                alternativeName.AddDnsName(cnName);
+                alternativeName.AddDnsName($"*.{cnName}");
+            }
 
             certificateRequest.CertificateExtensions.Add(alternativeName.Build());
 
@@ -250,7 +309,10 @@ namespace Fluxzy.Certificates
 
             randomGenerator.NextBytes(buffer); // TODO check for collision here 
 
-            var notBefore = rootCertificate.NotBefore.AddSeconds(1);
+            // Start the leaf no earlier than the root CA, but never in the future: a freshly
+            // created root has a NotBefore set to "now", so adding any positive offset would
+            // make the leaf not-yet-valid until the wall clock catches up.
+            var notBefore = rootCertificate.NotBefore;
             var now = DateTime.Today;
             notBefore = now < notBefore ? notBefore : now;
 

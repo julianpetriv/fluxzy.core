@@ -1,7 +1,8 @@
 // Copyright 2021 - Haga Rakotoharivelo - https://github.com/haga-rak
 
-using System.Collections.Generic;
 using Fluxzy.Clients.H11;
+using Fluxzy.Utils.ProcessTracking;
+using System.Collections.Generic;
 
 namespace Fluxzy
 {
@@ -35,10 +36,16 @@ namespace Fluxzy
 
         Agent? Agent { get; }
 
+        ProcessInfo? ProcessInfo { get; }
+
         List<ClientError> ClientErrors { get; }
 
         IEnumerable<HeaderFieldInfo> GetRequestHeaders();
 
         IEnumerable<HeaderFieldInfo>? GetResponseHeaders();
+
+        IEnumerable<HeaderFieldInfo>? GetRequestTrailers();
+
+        IEnumerable<HeaderFieldInfo>? GetResponseTrailers();
     }
 }

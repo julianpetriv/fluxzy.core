@@ -59,6 +59,15 @@ namespace Fluxzy
         public int ConnectionPerHost { get; internal set; } = FluxzySharedSetting.MaxConnectionPerHost;
 
         /// <summary>
+        ///     Maximum time fluxzy waits for an upstream `100 Continue` (or a final
+        ///     response) after forwarding a request carrying `Expect: 100-continue`
+        ///     before falling back to sending the request body. Default: 1 second
+        ///     (matches .NET's `HttpClient.Expect100ContinueTimeout`).
+        /// </summary>
+        [JsonInclude]
+        public TimeSpan ExpectContinueTimeout { get; internal set; } = TimeSpan.FromSeconds(1);
+
+        /// <summary>
         ///     Ssl protocols for remote host connection
         /// </summary>
         [JsonInclude]
@@ -208,10 +217,85 @@ namespace Fluxzy
         [JsonInclude]
         public bool SkipRemoteCertificateValidation { get; internal set; }
 
+        /// <summary>
+        ///    Indicates whether Fluxzy should use HTTP/2 for client connections when supported.
+        /// </summary>
+        [JsonInclude]
+        public bool ServeH2 { get; internal set; }
+
+        /// <summary>
+        ///     When set to true, the server certificate will be exported as PEM in the SSL connection information.
+        ///     This is useful for diagnostics or auditing purposes.
+        /// </summary>
+        [JsonInclude]
+        public bool ExportCertificateInSslInfo { get; internal set; }
+
+        /// <summary>
+        ///     When enabled, Fluxzy will attempt to identify the local process
+        ///     that initiated each connection using the source port.
+        ///     Only works for localhost connections. Default is false.
+        /// </summary>
+        [JsonInclude]
+        public bool EnableProcessTracking { get; internal set; }
+
+        /// <summary>
+        ///     When enabled, the IsSelfFilter will also consider 10.0.2.2 as a local address.
+        ///     This is useful when Fluxzy is used with Android emulators where 10.0.2.2
+        ///     represents the host machine from within the emulator. Default is true.
+        /// </summary>
+        [JsonInclude]
+        public bool IncludeAndroidEmulatorHost { get; internal set; } = true;
+
+        /// <summary>
+        ///     When enabled, Fluxzy will announce its presence on the local network via mDNS.
+        ///     This allows clients to discover the proxy automatically. Default is false.
+        /// </summary>
+        [JsonInclude]
+        public bool EnableDiscoveryService { get; internal set; }
+
+        /// <summary>
+        ///     Directories containing .proto files for gRPC/protobuf decoding in formatters.
+        /// </summary>
+        [JsonInclude]
+        public List<string> ProtoDirectories { get; internal set; } = new();
+
+        /// <summary>
+        ///     When false (default), header values whose name matches <see cref="LogRedactedHeaders" />
+        ///     are replaced with "&lt;redacted, len=N&gt;" in Trace-level envelope logs (event 1099).
+        ///     Set to true only when you accept emitting credentials and cookies to your logging backend.
+        /// </summary>
+        [JsonInclude]
+        public bool LogIncludeSensitiveHeaders { get; internal set; }
+
+        /// <summary>
+        ///     Case-insensitive set of header names whose values are redacted in Trace-level
+        ///     envelope logs unless <see cref="LogIncludeSensitiveHeaders" /> is true.
+        /// </summary>
+        [JsonInclude]
+        public HashSet<string> LogRedactedHeaders { get; internal set; } =
+            new(StringComparer.OrdinalIgnoreCase) {
+                "Authorization",
+                "Proxy-Authorization",
+                "Cookie",
+                "Set-Cookie",
+                "X-Auth-Token"
+            };
+
+        /// <summary>
+        ///     When true, Fluxzy will not register its built-in rules
+        ///     (welcome page on self-requests, CA download endpoint at /ca).
+        /// </summary>
+        [JsonInclude]
+        public bool SkipInternalRules { get; internal set; }
+
         internal IEnumerable<Rule> FixedRules()
         {
             if (GlobalSkipSslDecryption) {
                 yield return new Rule(new SkipSslTunnelingAction(), AnyFilter.Default);
+            }
+
+            if (SkipInternalRules) {
+                yield break;
             }
 
             yield return new Rule(

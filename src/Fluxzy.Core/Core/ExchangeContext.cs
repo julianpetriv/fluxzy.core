@@ -41,6 +41,7 @@ namespace Fluxzy.Core
             FluxzySetting = fluxzySetting;
             SetUserAgentActionMapping = setUserAgentActionMapping;
             SkipRemoteCertificateValidation = fluxzySetting?.SkipRemoteCertificateValidation ?? false;
+            AdvancedTlsSettings.ExportCertificateInSslInfo = fluxzySetting?.ExportCertificateInSslInfo ?? false;
         }
 
         /// <summary>
@@ -208,6 +209,12 @@ namespace Fluxzy.Core
         public bool DnsOverHttpsCapture { get; set; }
 
         public bool AlwaysSendClientCertificate { get; set; }
+
+        /// <summary>
+        ///     When true, force the downstream (client-to-proxy) connection to use HTTP/1.1
+        ///     by only advertising HTTP/1.1 in the ALPN negotiation, regardless of the global ServeH2 setting.
+        /// </summary>
+        public bool ForceServeHttp11 { get; set; }
 
         /// <summary>
         ///     Register a response body substitution

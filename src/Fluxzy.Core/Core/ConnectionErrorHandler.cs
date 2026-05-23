@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Fluxzy.Clients;
 using Fluxzy.Clients.H2;
+using Fluxzy.Clients.H2.Encoder;
 using Fluxzy.Misc.ResizableBuffers;
 using Fluxzy.Rules;
 using Fluxzy.Writers;
@@ -20,12 +21,14 @@ namespace Fluxzy.Core
     internal static class ConnectionErrorHandler
     {
         private static readonly JsonSerializerOptions PrettyJsonOptions = new JsonSerializerOptions { WriteIndented = true };
-        
+
         public static bool RequalifyOnResponseSendError(
             Exception ex,
             Exchange exchange, ITimingProvider timingProvider)
         {
             // Filling client error
+
+            var extraHeaders = new StringBuilder();
 
             if (exchange.Metrics.ResponseBodyEnd == default) {
                 exchange.Metrics.ResponseBodyEnd = timingProvider.Instant();
@@ -34,71 +37,42 @@ namespace Fluxzy.Core
             var remoteIpAddress = exchange.Connection?.RemoteAddress?.ToString();
 
             if (ex.TryGetException<SocketException>(out var socketException)) {
-                switch (socketException.SocketErrorCode) {
-                    case SocketError.ConnectionReset: {
-                        var clientError = new ClientError(
-                            (int) socketException.SocketErrorCode,
-                            $"The connection was reset by remote peer {remoteIpAddress}.") {
-                            ExceptionMessage = socketException.Message
-                        };
+                var (message, socketErrorToken) = MapSocketError(
+                    socketException.SocketErrorCode, remoteIpAddress, exchange.Authority.Port);
 
-                        exchange.ClientErrors.Add(clientError);
-
-                        break;
-                    }
-
-                    case SocketError.TimedOut: {
-                        var clientError = new ClientError(
-                            (int) socketException.SocketErrorCode,
-                            $"The remote peer ({remoteIpAddress}) " +
-                            $"could not be contacted within the configured timeout on the port {exchange.Authority.Port}.") {
-                            ExceptionMessage = socketException.Message
-                        };
-
-                        exchange.ClientErrors.Add(clientError);
-
-                        break;
-                    }
-
-                    case SocketError.ConnectionRefused: {
-                        var clientError = new ClientError(
-                            (int) socketException.SocketErrorCode,
-                            $"The remote peer ({remoteIpAddress}) responded but refused actively to establish a connection.") {
-                            ExceptionMessage = socketException.Message
-                        };
-
-                        exchange.ClientErrors.Add(clientError);
-
-                        break;
-                    }
-
-                    default: {
-                        var clientError = new ClientError(
-                            (int) socketException.SocketErrorCode,
-                            "A socket exception has occured") {
-                            ExceptionMessage = socketException.Message
-                        };
-
-                        exchange.ClientErrors.Add(clientError);
-
-                        break;
-                    }
-                }
+                exchange.ClientErrors.Add(new ClientError(
+                    (int) socketException.SocketErrorCode, message, socketErrorToken) {
+                    ExceptionMessage = socketException.Message
+                });
             }
 
             if (ex.TryGetException<ClientErrorException>(out var clientErrorException)) {
                 exchange.ClientErrors.Add(clientErrorException.ClientError);
             }
-            
+
             if (ex.TryGetException<RuleExecutionFailureException>(out var ruleExecutionFailureException)) {
-                exchange.ClientErrors.Add(new ClientError(999, ruleExecutionFailureException.Message));
+                exchange.ClientErrors.Add(new ClientError(999, ruleExecutionFailureException.Message,
+                    NetworkErrorCodes.RuleFailure));
             }
 
             if (!exchange.ClientErrors.Any()) {
-                exchange.ClientErrors.Add(new ClientError(0, "A generic error has occured") {
+
+                extraHeaders.Append($"x-fluxzy-error-code: 0\r\n");
+                extraHeaders.Append($"x-fluxzy-error-message: {ExceptionUtils.SanitizeHeaderValue(ex.Message)}\r\n");
+
+
+                exchange.ClientErrors.Add(new ClientError(0, ex.Message, ResolveNetworkErrorCode(ex)) {
                     ExceptionMessage = ex.Message
                 });
             }
+
+            // Always emit x-fluxzy-network-error so consumers can react programmatically.
+            var networkErrorCode = exchange.ClientErrors
+                                           .Select(e => e.NetworkErrorCode)
+                                           .FirstOrDefault(code => !string.IsNullOrEmpty(code))
+                                  ?? ResolveNetworkErrorCode(ex);
+
+            extraHeaders.Append($"x-fluxzy-network-error: {networkErrorCode}\r\n");
 
             if (ex is SocketException ||
                 ex is IOException ||
@@ -127,6 +101,15 @@ namespace Fluxzy.Core
                     var header = string.Format(ConnectionErrorConstants.Generic502,
                         messageBinary.Length);
 
+                    if (extraHeaders.Length > 0) {
+                        // Insert after the final header line's CRLF, before the empty-line CRLF
+                        // that separates headers from body — otherwise the new header gets
+                        // glued onto the tail of the previous one and the parser merges them.
+                        var idx = header.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+
+                        header = header.Insert(idx + 2, extraHeaders.ToString());
+                    }
+
                     exchange.Response.Header = new ResponseHeader(
                         header.AsMemory(),
                         exchange.Authority.Secure, true);
@@ -144,6 +127,13 @@ namespace Fluxzy.Core
                         exchange.Authority,
                         exchange.ClientErrors,
                         ex);
+
+                    if (extraHeaders.Length > 0)
+                    {
+                        var idx = header.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+
+                        header = header.Insert(idx + 2, extraHeaders.ToString());
+                    }
 
                     exchange.Response.Header = new ResponseHeader(
                         header.AsMemory(),
@@ -175,7 +165,7 @@ namespace Fluxzy.Core
             var message = "A configuration error has occured.\r\n";
 
             if (ex is RuleExecutionFailureException ruleException) {
-                message = 
+                message =
                     "A rule execution failure has occured.\r\n\r\n" + ruleException.Message;
             }
 
@@ -189,7 +179,14 @@ namespace Fluxzy.Core
                 exchange.Authority,
                 message, ex.ToString());
 
-            exchange.ClientErrors.Add(new ClientError(9999, message));
+            var networkErrorCode = ex is RuleExecutionFailureException
+                ? NetworkErrorCodes.RuleFailure
+                : NetworkErrorCodes.Unknown;
+
+            var endOfHeaders = header.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            header = header.Insert(endOfHeaders + 2, $"x-fluxzy-network-error: {networkErrorCode}\r\n");
+
+            exchange.ClientErrors.Add(new ClientError(9999, message, networkErrorCode));
 
             exchange.Response.Header = new ResponseHeader(
                 header.AsMemory(),
@@ -199,12 +196,12 @@ namespace Fluxzy.Core
 
             exchange.Metrics.ResponseHeaderStart = timingProvider.Instant();
 
-            await downStreamPipe.WriteResponseHeader(exchange.Response.Header, buffer, true, token);
+            await downStreamPipe.WriteResponseHeader(exchange.Response.Header, buffer, true, exchange.StreamIdentifier, exchange.Request.Header.Method, token);
 
             exchange.Metrics.ResponseHeaderEnd = timingProvider.Instant();
             exchange.Metrics.ResponseBodyStart = timingProvider.Instant();
 
-            await downStreamPipe.WriteResponseBody(exchange.Response.Body, buffer, false, token);
+            await downStreamPipe.WriteResponseBody(exchange.Response.Body, buffer, false, exchange.StreamIdentifier, exchange.Response, token);
 
             if (exchange.Metrics.ResponseBodyEnd == default)
             {
@@ -220,6 +217,78 @@ namespace Fluxzy.Core
 
 
             return true;
+        }
+
+        internal static string ResolveNetworkErrorCode(Exception ex)
+        {
+            for (var current = ex; current != null; current = current.InnerException) {
+                if (current is ClientErrorException cee && !string.IsNullOrEmpty(cee.ClientError.NetworkErrorCode)) {
+                    return cee.ClientError.NetworkErrorCode!;
+                }
+
+                if (current is RuleExecutionFailureException) {
+                    return NetworkErrorCodes.RuleFailure;
+                }
+
+                if (current is AuthenticationException) {
+                    return NetworkErrorCodes.TlsHandshakeFailure;
+                }
+            }
+
+            return NetworkErrorCodes.Unknown;
+        }
+
+        internal static (string Message, string NetworkErrorCode) MapSocketError(
+            SocketError code, string? remoteIpAddress, int port)
+        {
+            return code switch {
+                SocketError.ConnectionReset => (
+                    $"The connection was reset by remote peer {remoteIpAddress}.",
+                    NetworkErrorCodes.ConnectionReset),
+
+                // EPIPE on Linux: peer sent RST (or closed) and we then tried to write.
+                // .NET surfaces this as SocketError.Shutdown — semantically a reset by peer.
+                SocketError.Shutdown => (
+                    $"The connection was reset by remote peer {remoteIpAddress}.",
+                    NetworkErrorCodes.ConnectionReset),
+
+                SocketError.TimedOut => (
+                    $"The remote peer ({remoteIpAddress}) " +
+                    $"could not be contacted within the configured timeout on the port {port}.",
+                    NetworkErrorCodes.ConnectionTimeout),
+
+                SocketError.ConnectionRefused => (
+                    $"The remote peer ({remoteIpAddress}) responded but refused actively to establish a connection.",
+                    NetworkErrorCodes.ConnectionRefused),
+
+                SocketError.ConnectionAborted => (
+                    $"The connection was aborted by remote peer {remoteIpAddress}.",
+                    NetworkErrorCodes.ConnectionAborted),
+
+                SocketError.HostUnreachable => (
+                    $"The remote host ({remoteIpAddress}) is unreachable.",
+                    NetworkErrorCodes.HostUnreachable),
+
+                SocketError.NetworkUnreachable => (
+                    "The remote network is unreachable.",
+                    NetworkErrorCodes.NetworkUnreachable),
+
+                SocketError.HostNotFound => (
+                    "DNS lookup failed: host not found.",
+                    NetworkErrorCodes.DnsNotFound),
+
+                SocketError.TryAgain => (
+                    "DNS lookup failed.",
+                    NetworkErrorCodes.DnsTryAgain),
+
+                SocketError.NoData => (
+                    "DNS lookup failed.",
+                    NetworkErrorCodes.DnsNoData),
+
+                _ => (
+                    "A socket exception has occured",
+                    NetworkErrorCodes.Unknown)
+            };
         }
     }
 }

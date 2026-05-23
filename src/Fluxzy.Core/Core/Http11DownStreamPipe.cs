@@ -12,49 +12,35 @@ using Fluxzy.Misc.Streams;
 
 namespace Fluxzy.Core
 {
-    public interface IDownStreamPipe : IDisposable
-    {
-        Authority RequestedAuthority { get; }
-
-        bool TunnelOnly { get; }
-
-        ValueTask<Exchange?> ReadNextExchange(RsBuffer buffer, ExchangeScope exchangeScope, CancellationToken token);
-
-        ValueTask WriteResponseHeader(ResponseHeader responseHeader, RsBuffer buffer, bool shouldClose, CancellationToken token);
-
-        ValueTask WriteResponseBody(Stream responseBodyStream, RsBuffer rsBuffer, bool chunked, CancellationToken token);
-
-        (Stream ReadStream, Stream WriteStream) AbandonPipe();
-
-        bool CanWrite { get; }
-    }
-
     internal class Http11DownStreamPipe : IDownStreamPipe
     {
         private readonly IIdProvider _idProvider;
         private readonly IExchangeContextBuilder _contextBuilder;
         private static int _count;
 
-        public Http11DownStreamPipe(IIdProvider idProvider, 
-            Authority requestedAuthority, Stream readStream, Stream writeStream, bool tunnelOnly,
+        private Stream? _readStream;
+        private Stream? _writeStream;
+
+        public Http11DownStreamPipe(
+            IIdProvider idProvider,
+            Authority requestedAuthority, Stream readStream, Stream writeStream,
             IExchangeContextBuilder contextBuilder)
         {
             _idProvider = idProvider;
             _contextBuilder = contextBuilder;
             RequestedAuthority = requestedAuthority;
-            ReadStream = readStream;
-            WriteStream = writeStream;
-            TunnelOnly = tunnelOnly;
+            _readStream = readStream;
+            _writeStream = writeStream;
 
             var id = Interlocked.Increment(ref _count);
 
             if (DebugContext.EnableNetworkFileDump)
             {
-                ReadStream = new DebugFileStream($"raw/{id:0000}_browser_",
-                    ReadStream, true);
+                _readStream = new DebugFileStream($"raw/{id:0000}_browser_",
+                    _readStream, true);
 
-                WriteStream = new DebugFileStream($"raw/{id:0000}_browser_",
-                    WriteStream, false);
+                _writeStream = new DebugFileStream($"raw/{id:0000}_browser_",
+                    _writeStream, false);
             }
         }
 
@@ -68,13 +54,13 @@ namespace Fluxzy.Core
 
         public virtual async ValueTask<Exchange?> ReadNextExchange(RsBuffer buffer, ExchangeScope exchangeScope, CancellationToken token)
         { 
-            if (ReadStream == null)
+            if (_readStream == null)
                 throw new FluxzyException("Down stream has already been abandoned");
 
             // Every next request after the first one is read from the stream
 
             var blockReadResult = await
-                Http11HeaderBlockReader.GetNext(ReadStream, buffer, null, null, throwOnError: false, token)
+                Http11HeaderBlockReader.GetNext(_readStream, buffer, null, null, throwOnError: false, token)
                                        .ConfigureAwait(false);
 
             if (blockReadResult.TotalReadLength == 0)
@@ -94,61 +80,82 @@ namespace Fluxzy.Core
 
             if (remainingLength > 0) 
             {
-                ReadStream = new CombinedReadonlyStream(false,
-                    buffer.Buffer.AsSpan(blockReadResult.HeaderLength, remainingLength), ReadStream);
+                _readStream = new CombinedReadonlyStream(false,
+                    buffer.Buffer.AsSpan(blockReadResult.HeaderLength, remainingLength), _readStream);
             }
 
             var exchangeContext = await _contextBuilder.Create(RequestedAuthority, RequestedAuthority.Secure).ConfigureAwait(false);
 
-            var bodyStream = SetChunkedBody(secureHeader, ReadStream);
+            var bodyStream = SetChunkedBody(secureHeader, _readStream);
 
             return new Exchange(_idProvider, exchangeContext, RequestedAuthority, secureHeader, bodyStream, null!, receivedFromProxy);
         }
 
-        public async ValueTask WriteResponseHeader(ResponseHeader responseHeader, RsBuffer buffer, bool shouldClose, CancellationToken token)
+        public async ValueTask WriteInterimResponse(int statusCode, ReadOnlyMemory<char> reasonPhrase, int _, CancellationToken token)
         {
-            if (WriteStream == null)
+            if (_writeStream == null)
                 throw new FluxzyException("Down stream has already been closed");
 
-            if (WriteStream != null)
+            // "HTTP/1.1 NNN <reason>\r\n\r\n" — max ~64 bytes for typical reason phrases.
+            var line = $"HTTP/1.1 {statusCode} {reasonPhrase}\r\n\r\n";
+            var bytes = Encoding.ASCII.GetBytes(line);
+
+            await _writeStream.WriteAsync(bytes, 0, bytes.Length, token).ConfigureAwait(false);
+            await _writeStream.FlushAsync(token).ConfigureAwait(false);
+        }
+
+        public async ValueTask WriteResponseHeader(ResponseHeader responseHeader, RsBuffer buffer, bool shouldClose, int _, ReadOnlyMemory<char> requestMethod, CancellationToken token)
+        {
+            if (_writeStream == null)
+                throw new FluxzyException("Down stream has already been closed");
+
+            if (_writeStream != null)
             {
                 var responseHeaderLength = responseHeader.WriteHttp11(false, buffer, true, true, shouldClose);
-                await WriteStream.WriteAsync(buffer.Buffer, 0, responseHeaderLength, token).ConfigureAwait(false);
+                await _writeStream.WriteAsync(buffer.Buffer, 0, responseHeaderLength, token).ConfigureAwait(false);
             }
         }
 
-        public async ValueTask WriteResponseBody(Stream responseBodyStream, RsBuffer rsBuffer, bool chunked, CancellationToken token)
+        public async ValueTask WriteResponseBody(Stream responseBodyStream, RsBuffer rsBuffer, bool chunked, int _, Response? responseForTrailers, CancellationToken token)
         {
-            if (WriteStream == null)
+            if (_writeStream == null)
                 throw new FluxzyException("Down stream has already been closed");
 
-            var stream = WriteStream;
+            var stream = _writeStream;
+            ChunkedTransferWriteStream? chunkedWriter = null;
 
             if (chunked) {
-                stream =
-                    new ChunkedTransferWriteStream(stream);
+                chunkedWriter = new ChunkedTransferWriteStream(stream);
+                stream = chunkedWriter;
             }
 
             await responseBodyStream.CopyDetailed(stream, rsBuffer.Buffer, _ => { }, token).ConfigureAwait(false);
-            (stream as ChunkedTransferWriteStream)?.WriteEof();
+
+            if (chunkedWriter != null) {
+                // After body is drained, trailers are available on the Response object
+                await chunkedWriter.WriteEof(responseForTrailers?.Trailers).ConfigureAwait(false);
+            }
+
             await stream.FlushAsync(CancellationToken.None).ConfigureAwait(false);
         }
 
         public (Stream ReadStream, Stream WriteStream) AbandonPipe()
         {
-            if (ReadStream == null || WriteStream == null)
+            if (_readStream == null || _writeStream == null)
                 throw new FluxzyException("Down stream has already been closed");
 
-            var readStream = ReadStream;
-            var writeStream = WriteStream;
+            var readStream = _readStream;
+            var writeStream = _writeStream;
 
-            ReadStream = null;
-            WriteStream = null;
+            _readStream = null;
+            _writeStream = null;
 
             return (readStream, writeStream);
         }
 
-        public bool CanWrite => WriteStream != null;
+        public bool CanWrite => _writeStream != null;
+
+        public bool SupportsMultiplexing => false;
 
         public static Stream SetChunkedBody(RequestHeader plainHeader, Stream plainStream)
         {
@@ -168,8 +175,8 @@ namespace Fluxzy.Core
 
         public void Dispose()
         {
-            ReadStream?.Dispose();
-            WriteStream?.Dispose();
+            _readStream?.Dispose();
+            _writeStream?.Dispose();
         }
     }
 }

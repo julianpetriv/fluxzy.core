@@ -24,6 +24,29 @@ Official .NET builds are *signed* and published at [nuget.org](https://www.nuget
 - CLI binaries are available as assets or downloadable via [this page](https://www.fluxzy.io/download#cli). 
 - Docker images are available at [Docker Hub](https://hub.docker.com/r/fluxzy/fluxzy).
 
+**CLI Installation**
+
+npm (Windows, macOS, Linux):
+```
+npm install -g @fluxzy/cli
+```
+
+Or run directly without installing:
+```
+npx @fluxzy/cli start --llo
+```
+
+Windows (winget):
+```
+winget install Fluxzy.Fluxzy
+```
+
+macOS (Homebrew):
+```
+brew tap haga-rak/fluxzy
+brew install fluxzy
+```
+
 ";
 
         public static async Task<GhPublishHelper> Create(string token, string userName, string repositoryName)
@@ -132,8 +155,21 @@ Official .NET builds are *signed* and published at [nuget.org](https://www.nuget
                 throw new InvalidOperationException($"Tag {tagName} does not exists." +
                                                     $"NuGet package has to be published before adding assets");
 
+            // Get existing assets to check for duplicates
+            var existingAssets = await client.Repository.Release.GetAllAssets(_repositoryId, release.Id);
+
             foreach (var fileInfo in fileInfos)
             {
+                // Delete existing asset with same name if present
+                var existingAsset = existingAssets.FirstOrDefault(a =>
+                    string.Equals(a.Name, fileInfo.Name, StringComparison.OrdinalIgnoreCase));
+
+                if (existingAsset != null)
+                {
+                    Console.WriteLine($"Deleting existing asset: {existingAsset.Name}");
+                    await client.Repository.Release.DeleteAsset(_repositoryId, existingAsset.Id);
+                }
+
                 using var stream = fileInfo.OpenRead();
 
                 var assetUpload = new ReleaseAssetUpload(fileInfo.Name,
@@ -143,9 +179,21 @@ Official .NET builds are *signed* and published at [nuget.org](https://www.nuget
 
                 if (addHash)
                 {
+                    var hashFileName = $"{fileInfo.Name}.sha256";
+
+                    // Delete existing hash file if present
+                    var existingHashAsset = existingAssets.FirstOrDefault(a =>
+                        string.Equals(a.Name, hashFileName, StringComparison.OrdinalIgnoreCase));
+
+                    if (existingHashAsset != null)
+                    {
+                        Console.WriteLine($"Deleting existing asset: {existingHashAsset.Name}");
+                        await client.Repository.Release.DeleteAsset(_repositoryId, existingHashAsset.Id);
+                    }
+
                     using var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(HashHelper.GetWinGetHash(fileInfo)));
 
-                    var hashPayload = new ReleaseAssetUpload($"{fileInfo.Name}.sha256",
+                    var hashPayload = new ReleaseAssetUpload(hashFileName,
                         "text/plain", memoryStream, null);
 
                     await client.Repository.Release.UploadAsset(release, hashPayload);

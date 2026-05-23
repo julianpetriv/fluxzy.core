@@ -110,6 +110,18 @@ namespace Fluxzy.Cli.Commands
             return option;
         }
 
+        public static Option CreateSkipInternalRulesOption()
+        {
+            var option = new Option<bool>(
+                "--skip-internal-rules",
+                "Do not add Fluxzy's built-in rules (welcome page, /ca certificate endpoint)");
+
+            option.SetDefaultValue(false);
+            option.Arity = ArgumentArity.Zero;
+
+            return option;
+        }
+
         public static Option CreateListenLocalhost()
         {
             var option = new Option<bool>(
@@ -400,15 +412,126 @@ namespace Fluxzy.Cli.Commands
             return option;
         }
 
-        public static Option CreateEnableTracingOption()
+        public static Option CreateEnableProcessTrackingOption()
         {
             var option = new Option<bool>(
-                "--trace",
-                "Output trace on stdout");
+                "--enable-process-tracking",
+                "Enable tracking of the local process that initiated each request. " +
+                "Only works for connections originating from localhost.");
 
-            option.AddAlias("-t");
             option.SetDefaultValue(false);
             option.Arity = ArgumentArity.Zero;
+
+            return option;
+        }
+
+        public static Option CreateNoAndroidEmulatorOption()
+        {
+            var option = new Option<bool>(
+                "--no-android-emulator",
+                "Disable inclusion of Android emulator host (10.0.2.2) in self detection. " +
+                "By default, Fluxzy considers 10.0.2.2 as a local address for Android emulator compatibility.");
+
+            option.SetDefaultValue(false);
+            option.Arity = ArgumentArity.Zero;
+
+            return option;
+        }
+
+        public static Option CreatePrettyOutputOption()
+        {
+            var option = new Option<bool>(
+                "--pretty",
+                "Enable interactive pretty output with live exchange table and statistics panel");
+
+            option.AddAlias("-p");
+            option.SetDefaultValue(false);
+            option.Arity = ArgumentArity.Zero;
+
+            return option;
+        }
+
+        public static Option CreatePrettyMaxRowsOption()
+        {
+            var option = new Option<int>(
+                "--pretty-max-rows",
+                "Maximum number of exchanges to keep in the pretty output buffer");
+
+            option.SetDefaultValue(2000);
+            option.Arity = ArgumentArity.ExactlyOne;
+
+            return option;
+        }
+
+        public static Option CreateServeH2Option()
+        {
+            var option = new Option<bool>(
+                "--serve-h2",
+                "Enable HTTP/2 on the proxy's client-facing (downstream) side. " +
+                "When enabled, clients that support HTTP/2 over TLS will use it to communicate with the proxy.");
+
+            option.SetDefaultValue(false);
+            option.Arity = ArgumentArity.Zero;
+
+            return option;
+        }
+
+        public static Option CreateProtoDirectoryOption()
+        {
+            var option = new Option<List<string>>(
+                "--proto-dir",
+                "Directories containing .proto files for gRPC/protobuf decoding. Accepts multiple values.");
+
+            option.Arity = ArgumentArity.OneOrMore;
+            option.AllowMultipleArgumentsPerToken = true;
+            option.SetDefaultValue(new List<string>());
+
+            return option;
+        }
+
+        public static Option CreateEnableDiscoveryOption()
+        {
+            var option = new Option<bool>(
+                "--enable-discovery",
+                "Enable mDNS discovery service to announce the proxy on the local network. " +
+                "Allows clients to discover the proxy automatically.");
+
+            option.SetDefaultValue(false);
+            option.Arity = ArgumentArity.Zero;
+
+            return option;
+        }
+
+        public static Option<TraceMode> CreateTraceOption()
+        {
+            var option = new Option<TraceMode>(
+                "--trace",
+                result => {
+                    if (result.Tokens.Count == 0) {
+                        return TraceMode.Debug;
+                    }
+
+                    var value = result.Tokens.First().Value;
+
+                    if (string.Equals(value, "deep", StringComparison.OrdinalIgnoreCase)) {
+                        return TraceMode.Deep;
+                    }
+
+                    if (string.Equals(value, "debug", StringComparison.OrdinalIgnoreCase)) {
+                        return TraceMode.Debug;
+                    }
+
+                    result.ErrorMessage = $"Invalid trace value '{value}'. Expected: deep (or omit value for debug).";
+
+                    return TraceMode.None;
+                });
+
+            option.AddAlias("-t");
+            option.Description =
+                "Emit Fluxzy diagnostic logs to the console. " +
+                "Without a value, logs at Debug level. Use '-t deep' for verbose (Trace) level.";
+            option.SetDefaultValue(TraceMode.None);
+            option.Arity = ArgumentArity.ZeroOrOne;
 
             return option;
         }

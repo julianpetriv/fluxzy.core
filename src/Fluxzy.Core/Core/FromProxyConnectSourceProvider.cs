@@ -114,7 +114,7 @@ namespace Fluxzy.Core
 
                     return
                         new (false, new ExchangeSourceInitResult(
-                            new Http11DownStreamPipe(_idProvider, authority, stream, stream, true, _contextBuilder), 
+                            new Http11DownStreamPipe(_idProvider, authority, stream, stream, _contextBuilder), 
                             provisionalExchange));
                 }
 
@@ -134,11 +134,27 @@ namespace Fluxzy.Core
                 exchange.Metrics.CreateCertStart = certStart;
                 exchange.Metrics.CreateCertEnd = certEnd;
 
-                return
-                    new (false, 
-                    new ExchangeSourceInitResult
-                    (new Http11DownStreamPipe(_idProvider, authority, authenticateResult.InStream, authenticateResult.OutStream, false, _contextBuilder), exchange));
+                // Select downstream pipe based on negotiated protocol
+
+                IDownStreamPipe downStreamPipe;
+
+                if (authenticateResult.NegotiatedApplicationProtocol == System.Net.Security.SslApplicationProtocol.Http2) {
+                    var h2Pipe = new H2DownStreamPipe(_idProvider, authority,
+                        authenticateResult.InStream, authenticateResult.OutStream, _contextBuilder);
+
+                    using var rsBuffer = RsBuffer.Allocate(1024);
+                    await h2Pipe.Init(rsBuffer);
+                    downStreamPipe = h2Pipe;
+                }
+                else {
+                    downStreamPipe = new Http11DownStreamPipe(_idProvider, authority,
+                        authenticateResult.InStream, authenticateResult.OutStream, _contextBuilder);
+                }
+
+                return new(false, new ExchangeSourceInitResult(downStreamPipe, exchange));
             }
+
+            // Plain request 
 
             var remainder = blockReadResult.TotalReadLength - blockReadResult.HeaderLength;
 
@@ -148,8 +164,6 @@ namespace Fluxzy.Core
                     new CombinedReadonlyStream(true, buffer.Buffer.AsSpan(blockReadResult.HeaderLength, remainder), stream),
                     stream);
             }
-
-            // Plain request 
 
             var path = plainHeader.Path.ToString();
 
@@ -179,8 +193,8 @@ namespace Fluxzy.Core
                 plainAuthority,
                 plainHeader, bodyStream, "HTTP/1.1", receivedFromProxy);
 
-            return new (false, new ExchangeSourceInitResult(new Http11DownStreamPipe(
-                _idProvider, plainAuthority, stream, stream, false, _contextBuilder), nextExchange));
+            return new(false, new ExchangeSourceInitResult(new Http11DownStreamPipe(
+                _idProvider, plainAuthority, stream, stream, _contextBuilder), nextExchange));
         }
 
         private record ReadNextBlockResult(

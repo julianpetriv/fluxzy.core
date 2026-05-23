@@ -79,7 +79,7 @@ rules:
 rules:
 - filter:
     typeKind: hostFilter
-    pattern: (?<myvar>[^.]+)\.smartizy\.com
+    pattern: (?<myvar>[^.]+)\.fluxzy\.io
     operation: regex
   actions: 
   - typeKind: FileAppendAction
@@ -134,7 +134,7 @@ rules:
 
             Assert.NotNull(exchange.ResponseHeader);
             Assert.True(File.Exists("token-file.txt"), "File does not exists");
-            Assert.Equal("sandbox.smartizy.com --> "  + "a_bearer_token", File.ReadAllLines("token-file.txt").First());
+            Assert.Equal("sandbox.fluxzy.io --> "  + "a_bearer_token", File.ReadAllLines("token-file.txt").First());
         }
 
         [Fact]
@@ -169,6 +169,7 @@ rules:
         [InlineData("authority.secure", "Secure")]
         [InlineData("exchange.url", "FullUrl")]
         [InlineData("exchange.method", "Method")]
+        [InlineData("exchange.path", "Path")]
         [InlineData("exchange.status", "StatusCode")]
         [InlineData("exchange.id", "Id")]
         public async Task Self_Generated_Context_Variables(string variableName, string propertyName)

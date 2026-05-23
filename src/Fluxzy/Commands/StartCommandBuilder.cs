@@ -17,9 +17,10 @@ using Fluxzy.Core;
 using Fluxzy.Core.Pcap;
 using Fluxzy.Core.Pcap.Cli.Clients;
 using Fluxzy.Extensions;
-using Fluxzy.Misc.Traces;
 using Fluxzy.Rules;
 using Fluxzy.Utils.NativeOps.SystemProxySetup;
+using Fluxzy.Cli.Commands.PrettyOutput;
+using Microsoft.Extensions.Logging;
 
 namespace Fluxzy.Cli.Commands
 {
@@ -74,7 +75,6 @@ namespace Fluxzy.Cli.Commands
             command.AddOption(StartCommandOptions.CreateBouncyCastleOption());
             command.AddOption(StartCommandOptions.CreateTcpDumpOption());
             command.AddOption(StartCommandOptions.CreateOutOfProcCaptureOption());
-            command.AddOption(StartCommandOptions.CreateEnableTracingOption());
             command.AddOption(StartCommandOptions.CreateSkipCertInstallOption());
             command.AddOption(StartCommandOptions.CreateNoCertCacheOption());
             command.AddOption(StartCommandOptions.CreateCertificateFileOption());
@@ -87,6 +87,15 @@ namespace Fluxzy.Cli.Commands
             command.AddOption(StartCommandOptions.CreateProxyBuffer());
             command.AddOption(StartCommandOptions.CreateMaxConnectionPerHost());
             command.AddOption(StartCommandOptions.CreateCounterOption());
+            command.AddOption(StartCommandOptions.CreateEnableProcessTrackingOption());
+            command.AddOption(StartCommandOptions.CreateNoAndroidEmulatorOption());
+            command.AddOption(StartCommandOptions.CreatePrettyOutputOption());
+            command.AddOption(StartCommandOptions.CreatePrettyMaxRowsOption());
+            command.AddOption(StartCommandOptions.CreateServeH2Option());
+            command.AddOption(StartCommandOptions.CreateEnableDiscoveryOption());
+            command.AddOption(StartCommandOptions.CreateProtoDirectoryOption());
+            command.AddOption(StartCommandOptions.CreateTraceOption());
+            command.AddOption(StartCommandOptions.CreateSkipInternalRulesOption());
 
             command.SetHandler(context => Run(context, cancellationToken));
 
@@ -118,15 +127,19 @@ namespace Fluxzy.Cli.Commands
             var requestBuffer = invocationContext.Value<int?>("request-buffer");
             var maxConnectionPerHost = invocationContext.Value<int>("max-upstream-connection");
             var count = invocationContext.Value<int?>("max-capture-count");
-            var trace = invocationContext.Value<bool>("trace");
             var use502 = invocationContext.Value<bool>("use-502");
             var proxyMode = invocationContext.Value<ProxyMode>("mode");
             var modeReversePort = invocationContext.Value<int?>("mode-reverse-port");
             var proxyBasicAuthCredential = invocationContext.Value<NetworkCredential?>("proxy-auth-basic");
-
-            if (trace) {
-                D.EnableTracing = true;
-            }
+            var enableProcessTracking = invocationContext.Value<bool>("enable-process-tracking");
+            var noAndroidEmulator = invocationContext.Value<bool>("no-android-emulator");
+            var prettyOutput = invocationContext.Value<bool>("pretty");
+            var prettyMaxRows = invocationContext.Value<int>("pretty-max-rows");
+            var serveH2 = invocationContext.Value<bool>("serve-h2");
+            var enableDiscovery = invocationContext.Value<bool>("enable-discovery");
+            var protoDirectories = invocationContext.Value<List<string>>("proto-dir");
+            var traceMode = invocationContext.Value<TraceMode>("trace");
+            var skipInternalRules = invocationContext.Value<bool>("skip-internal-rules");
 
             FluxzySharedSetting.Use528 = !use502;
 
@@ -272,8 +285,23 @@ namespace Fluxzy.Cli.Commands
             proxyStartUpSetting.SetAutoInstallCertificate(installCert);
             proxyStartUpSetting.SetSkipGlobalSslDecryption(skipDecryption);
             proxyStartUpSetting.SetDisableCertificateCache(noCertCache);
-            proxyStartUpSetting.OutOfProcCapture = outOfProcCapture;
+            // When FLUXZY_SUDO_PASSWORD_FILE is set we can't capture in-process (the current
+            // process has no caps — the whole point of the file is to sudo the child). Force
+            // out-of-proc so the fluxzynetcap helper gets spawned under sudo.
+            proxyStartUpSetting.OutOfProcCapture = outOfProcCapture
+                || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("FLUXZY_SUDO_PASSWORD_FILE"));
             proxyStartUpSetting.UseBouncyCastle = bouncyCastle;
+            proxyStartUpSetting.SetEnableProcessTracking(enableProcessTracking);
+            proxyStartUpSetting.SetIncludeAndroidEmulatorHost(!noAndroidEmulator);
+            proxyStartUpSetting.SetServeH2(serveH2);
+            proxyStartUpSetting.SetEnableDiscoveryService(enableDiscovery);
+            proxyStartUpSetting.SetSkipInternalRules(skipInternalRules);
+
+            if (protoDirectories != null) {
+                foreach (var dir in protoDirectories) {
+                    proxyStartUpSetting.AddProtoDirectory(dir);
+                }
+            }
 
             var certificateProvider = new CertificateProvider(proxyStartUpSetting.CaCertificate,
                 noCertCache ? new InMemoryCertificateCache() : new FileSystemCertificateCache(proxyStartUpSetting));
@@ -283,7 +311,13 @@ namespace Fluxzy.Cli.Commands
             var uaParserProvider = parseUserAgent ? new UaParserUserAgentInfoProvider() : null;
             var systemProxyManager = new SystemProxyRegistrationManager(new NativeProxySetterManager().Get());
 
-            await using var scope = new ProxyScope(() => new FluxzyNetOutOfProcessHost(), a => new OutOfProcessCaptureContext(a));
+            using var loggerFactory = CreateTraceLoggerFactory(traceMode);
+
+            // Scope owns the out-of-proc capture subprocess lifetime. It must be disposed
+            // BEFORE PackDirectoryToFile runs so the subprocess closes its pcapng FileStreams
+            // and flushes all buffered packet data to disk; otherwise small captures can sit
+            // in the 4 KB FileStream buffer and the packager's Length==0 skip drops them.
+            await using (var scope = new ProxyScope(() => new FluxzyNetOutOfProcessHost(), a => new OutOfProcessCaptureContext(a))) {
 
             if (!ValidateSetting(invocationContext, proxyStartUpSetting)) {
                 invocationContext.ExitCode = 1;
@@ -296,7 +330,10 @@ namespace Fluxzy.Cli.Commands
                              : ITcpConnectionProvider.Default) {
                 await using (var proxy = new Proxy(proxyStartUpSetting, certificateProvider,
                                  new DefaultCertificateAuthorityManager(), tcpConnectionProvider, uaParserProvider,
-                                 externalCancellationSource: linkedTokenSource)) {
+                                 externalCancellationSource: linkedTokenSource,
+                                 loggerFactory: loggerFactory)) {
+
+
                     var endPoints = proxy.Run();
 
                     invocationContext.BindingContext.Console
@@ -309,28 +346,61 @@ namespace Fluxzy.Cli.Commands
                             $"Registered as system proxy on {setting.BoundHost}:{setting.ListenPort}");
                     }
 
-                    invocationContext.Console.Out.WriteLine("Ready to process connections, Ctrl+C to exit.");
+                    if (prettyOutput)
+                    {
+                        await using var renderer = new PrettyOutputRenderer(
+                            proxyStartUpSetting, prettyMaxRows, cancellationToken);
+                        renderer.SubscribeToProxy(proxy);
 
-                    try {
-                        await Task.Delay(-1, cancellationToken);
-                    }
-                    catch (OperationCanceledException) {
-                    }
-                    finally {
-                        if (registerAsSystemProxy) {
-                            try {
-                                await systemProxyManager.UnRegister();
-                            }
-                            catch (Exception ex) {
-                                invocationContext.Console.Error.WriteLine(
-                                    $"Failed to unregister as system proxy : {ex.Message}");
-                            }
+                        try
+                        {
+                            await renderer.RunAsync();
+                        }
+                        catch (OperationCanceledException) {
+                        }
+                        finally {
+                            renderer.UnsubscribeFromProxy(proxy);
+                            if (registerAsSystemProxy) {
+                                try {
+                                    await systemProxyManager.UnRegister();
+                                }
+                                catch (Exception ex) {
+                                    invocationContext.Console.Error.WriteLine(
+                                        $"Failed to unregister as system proxy : {ex.Message}");
+                                }
 
-                            invocationContext.Console.Out.WriteLine("Unregistered as system proxy");
+                                invocationContext.Console.Out.WriteLine("Unregistered as system proxy");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        invocationContext.Console.Out.WriteLine("Ready to process connections, Ctrl+C to exit.");
+
+                        try
+                        {
+                            await Task.Delay(-1, cancellationToken);
+                        }
+                        catch (OperationCanceledException) {
+                        }
+                        finally {
+                            if (registerAsSystemProxy) {
+                                try {
+                                    await systemProxyManager.UnRegister();
+                                }
+                                catch (Exception ex) {
+                                    invocationContext.Console.Error.WriteLine(
+                                        $"Failed to unregister as system proxy : {ex.Message}");
+                                }
+
+                                invocationContext.Console.Out.WriteLine("Unregistered as system proxy");
+                            }
                         }
                     }
                 }
             }
+
+            } // scope dispose: subprocess exits, pcapng FileStreams closed + flushed
 
             invocationContext.Console.Out.WriteLine("Proxy ended, gracefully");
 
@@ -345,6 +415,24 @@ namespace Fluxzy.Cli.Commands
 
                 invocationContext.Console.WriteLine("Packing output done.");
             }
+        }
+
+        private static ILoggerFactory? CreateTraceLoggerFactory(TraceMode traceMode)
+        {
+            if (traceMode == TraceMode.None) {
+                return null;
+            }
+
+            var minimumLevel = traceMode == TraceMode.Deep ? LogLevel.Trace : LogLevel.Debug;
+
+            return LoggerFactory.Create(builder => {
+                builder.SetMinimumLevel(minimumLevel);
+                builder.AddFilter("Fluxzy", minimumLevel);
+                builder.AddSimpleConsole(options => {
+                    options.SingleLine = true;
+                    options.TimestampFormat = "HH:mm:ss.fff ";
+                });
+            });
         }
 
         private static bool ValidateSetting(InvocationContext invocationContext, FluxzySetting proxyStartUpSetting)

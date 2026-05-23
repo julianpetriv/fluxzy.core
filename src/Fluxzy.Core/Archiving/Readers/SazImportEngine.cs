@@ -155,7 +155,8 @@ namespace Fluxzy.Readers
                         "HTTP/1.1",
                         SazConnectBodyUtility.GetKeyExchange(responseBodyString) ?? string.Empty,
                         HashAlgorithmType.Sha384,
-                        CipherAlgorithmType.Aes256
+                        CipherAlgorithmType.Aes256, default, default, default,
+                        null, null, null, null, null, null
                     );
                     
                     var connectConnectionInfo = new ConnectionInfo(
@@ -335,7 +336,7 @@ namespace Fluxzy.Readers
                 ArrayPool<byte>.Shared.Return(buffer);
             }
 
-            headers = Http11Parser.Read(requestHeaderString.AsMemory()).ToList();
+            headers = Http11Parser.Read(requestHeaderString.AsMemory());
 
             var res = stream.DrainUntil(4); // SKIP DOUBLE CRLF
 

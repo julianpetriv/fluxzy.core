@@ -94,34 +94,49 @@ namespace Fluxzy.Clients.H11
                 OpCode = wsFrame.OpCode;
 
             if (wsFrame.FinalFragment && Length == 0 && wsFrame.PayloadLength < maxWsMessageLengthBuffered) {
-                // Build direct buffer for message 
+                // Build direct buffer for message
 
                 var readResult = await pipeReader.ReadAtLeastAsync((int) wsFrame.PayloadLength, token).ConfigureAwait(false);
 
-                // TODO optimize with stackalloc on sequence
-
-                Data = readResult.Buffer.ToArray();
+                // ReadAtLeastAsync returns more than requested when extra bytes are buffered, and
+                // can return less when the writer completes early. Clamp on both sides so the slice
+                // never overshoots and a truncated payload is captured rather than thrown away.
+                var available = (int) Math.Min(readResult.Buffer.Length, wsFrame.PayloadLength);
+                Data = readResult.Buffer.Slice(0, available).ToArray();
 
                 ApplyXor(Data, wsFrame.MaskedPayload, 0);
 
                 WrittenLength = Data.Length;
 
-                pipeReader.AdvanceTo(readResult.Buffer.GetPosition(wsFrame.PayloadLength));
+                pipeReader.AdvanceTo(readResult.Buffer.GetPosition(available));
             }
             else {
                 await using var stream = outStream(Id);
                 var totalWr = 0;
+                long frameWritten = 0;
 
-                while (WrittenLength < wsFrame.PayloadLength) {
-                    // Write into file 
+                while (frameWritten < wsFrame.PayloadLength) {
+                    // Write into file
 
                     if (!pipeReader.TryRead(out var readResult))
                         readResult = await pipeReader.ReadAsync().ConfigureAwait(false);
 
+                    if (readResult.IsCanceled)
+                        break;
+
                     // readResult.Buffer.Slice()
 
                     var effectiveBufferLength =
-                        (int) Math.Min(readResult.Buffer.Length, wsFrame.PayloadLength - WrittenLength);
+                        (int) Math.Min(readResult.Buffer.Length, wsFrame.PayloadLength - frameWritten);
+
+                    // Writer is done and the buffer can't fill the rest of the frame: stop draining
+                    // a truncated message instead of spinning forever on empty IsCompleted reads.
+                    if (effectiveBufferLength == 0) {
+                        pipeReader.AdvanceTo(readResult.Buffer.Start);
+                        if (readResult.IsCompleted)
+                            break;
+                        continue;
+                    }
 
                     var totalWriteInSequence = 0;
 
@@ -157,12 +172,10 @@ namespace Fluxzy.Clients.H11
                         totalWriteInSequence += memory.Length;
                     }
 
+                    frameWritten += effectiveBufferLength;
                     WrittenLength += effectiveBufferLength;
 
                     pipeReader.AdvanceTo(readResult.Buffer.GetPosition(effectiveBufferLength));
-                }
-
-                if (wsFrame.FinalFragment) {
                 }
             }
 
